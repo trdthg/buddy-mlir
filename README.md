@@ -81,6 +81,32 @@ $ cmake -G Ninja .. -DBUDDY_ENABLE_E2E_TESTS=ON
 $ ninja check-e2e
 ```
 
+## Build Python Package
+
+We now use `setuptools` to bundle the prebuilt CMake outputs (Python packages,
+`bin/`, and `lib/`) into a single wheel. Make sure your CMake build was
+configured with `-DBUDDY_MLIR_ENABLE_PYTHON_PACKAGES=ON` and is up to date.
+
+```bash
+# From repo root
+export BUDDY_BUILD_DIR=${BUDDY_BUILD_DIR:-$(pwd)/build}
+# Ensure the CMake tree already exists:
+# cmake -G Ninja -B "$BUDDY_BUILD_DIR" -S . -DBUDDY_MLIR_ENABLE_PYTHON_PACKAGES=ON ...
+# cmake --build "$BUDDY_BUILD_DIR"
+
+python3 -m build --wheel --outdir build/dist
+```
+
+Install and test the wheel:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install build/dist/buddy-*.whl --no-deps
+python -c "import buddy; import buddy_mlir; print('ok')"
+# Binaries are exposed via entry points, e.g.:
+buddy-opt --help
+```
+
 ## Examples
 
 We provide examples to demonstrate how to use the passes and interfaces in `buddy-mlir`, including IR-level transformations, domain-specific applications, and testing demonstrations.
