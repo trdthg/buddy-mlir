@@ -1,0 +1,72 @@
+name: examples manual regression
+
+on:
+  workflow_dispatch:
+    inputs:
+      case_filter:
+        description: "Case filter passed to examples/run_examples.py --filter"
+        required: false
+        default: "*"
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - name: Set up ninja
+        uses: seanmiddleditch/gha-setup-ninja@master
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: "false"
+
+      - name: Get LLVM submodule commit
+        id: llvm-submodule-commit
+        run: |
+          echo "commit=$(git submodule status llvm | awk '{print $1;}')" >> $GITHUB_OUTPUT
+
+      - name: Cache LLVM source
+        id: cache-llvm-source
+        uses: actions/cache@v4
+        with:
+          path: llvm
+          key: llvm-source-${{ steps.llvm-submodule-commit.outputs.commit }}
+          restore-keys: |
+            llvm-source-
+
+      - name: Checkout LLVM submodule
+        if: steps.cache-llvm-source.outputs.cache-hit != 'true'
+        run: |
+          rm -rf llvm
+          git submodule update --init --recursive llvm
+
+      - name: Cache LLVM build directory
+        id: cache-llvm-build-dir
+        uses: actions/cache@v4
+        with:
+          path: llvm/build-release
+          key: llvm-build-release-${{ steps.llvm-submodule-commit.outputs.commit }}
+          restore-keys: |
+            llvm-build-release
+
+      - name: Install runner python deps
+        run: |
+          source ~/miniforge3/bin/activate buddy
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt rich
+
+      - name: Build LLVM/MLIR and Buddy release dist
+        run: |
+          source ~/miniforge3/bin/activate buddy
+          ./scripts/release-all.sh
+
+      - name: Run examples regression
+        run: |
+          source ~/miniforge3/bin/activate buddy
+          python examples/run_examples.py run \
+            --source-dir "$GITHUB_WORKSPACE" \
+            --build-dir "$GITHUB_WORKSPACE/build-release/examples-regression" \
+            --mlir-dir "$GITHUB_WORKSPACE/llvm/build-release/dist/lib/cmake/mlir" \
+            --llvm-dir "$GITHUB_WORKSPACE/llvm/build-release/dist/lib/cmake/llvm" \
+            --buddy-dir "$GITHUB_WORKSPACE/build-release/dist" \
+            --filter "${{ inputs.case_filter }}"
