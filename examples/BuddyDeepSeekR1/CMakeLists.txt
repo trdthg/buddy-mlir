@@ -29,8 +29,24 @@ if(NOT IS_RVV_PLATFORM)
            ${CMAKE_CURRENT_BINARY_DIR}/forward_decode.mlir
            ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode.mlir
            ${CMAKE_CURRENT_BINARY_DIR}/arg0.data
+    BYPRODUCTS
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_timed.mlir
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_timed.mlir
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_graph.json
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_graph.dot
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_profile.json
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_profile.dot
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_profile_merged.json
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_prefill_module_hierarchy.svg
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_graph.json
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_graph.dot
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_profile.json
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_profile.dot
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_profile_merged.json
+           ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_module_hierarchy.svg
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-deepseek-r1.py
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}
+            --enable-profile
     COMMENT "Generating forward.mlir, subgraph0.mlir and arg0.data..."
   )
 
@@ -695,6 +711,7 @@ set(DEEPSEEKR1_EXAMPLE_BUILD_PATH ${CMAKE_CURRENT_BINARY_DIR})
 target_compile_definitions(buddy-deepseek-r1-run PRIVATE
   DEEPSEEKR1_EXAMPLE_PATH="${DEEPSEEKR1_EXAMPLE_PATH}/"
   DEEPSEEKR1_EXAMPLE_BUILD_PATH="${DEEPSEEKR1_EXAMPLE_BUILD_PATH}/"
+  DEEPSEEKR1_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
 )
 target_compile_definitions(buddy-deepseek-r1-f16-run PRIVATE
   DEEPSEEKR1_EXAMPLE_PATH="${DEEPSEEKR1_EXAMPLE_PATH}/"
@@ -707,6 +724,7 @@ target_compile_definitions(buddy-deepseek-r1-bf16-run PRIVATE
 target_compile_definitions(buddy-deepseek-r1-cli PRIVATE
   DEEPSEEKR1_EXAMPLE_PATH="${DEEPSEEKR1_EXAMPLE_PATH}/"
   DEEPSEEKR1_EXAMPLE_BUILD_PATH="${DEEPSEEKR1_EXAMPLE_BUILD_PATH}/"
+  DEEPSEEKR1_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
 )
 target_compile_options(buddy-deepseek-r1-cli PRIVATE -fno-rtti)
 

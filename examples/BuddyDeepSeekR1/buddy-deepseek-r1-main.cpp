@@ -49,6 +49,8 @@ extern "C" double _mlir_ciface_rtclock() {
 #endif // _WIN32
 }
 
+extern "C" void _mlir_ciface_record_timing(void *, double) {}
+
 struct MemRefContainer {
 
   MemRef<float, 4> kv0;

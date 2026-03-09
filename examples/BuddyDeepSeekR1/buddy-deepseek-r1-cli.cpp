@@ -23,10 +23,15 @@
 #include <cmath>
 #include <csignal>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -44,6 +49,33 @@ namespace {
 
 std::atomic<bool> g_receivedSigInt(false);
 
+struct TimingRecord {
+  std::string opName;
+  double totalMs = 0.0;
+  double minMs = std::numeric_limits<double>::max();
+  double maxMs = 0.0;
+  size_t calls = 0;
+
+  void addTime(double durationSec) {
+    const double durationMs = durationSec * 1000.0;
+    totalMs += durationMs;
+    minMs = std::min(minMs, durationMs);
+    maxMs = std::max(maxMs, durationMs);
+    ++calls;
+  }
+
+  double getAvgMs() const { return calls == 0 ? 0.0 : totalMs / calls; }
+  double getMinMs() const { return calls == 0 ? 0.0 : minMs; }
+  double getMaxMs() const { return calls == 0 ? 0.0 : maxMs; }
+};
+
+enum class ProfilePhase { None, Prefill, Decode };
+
+std::mutex gTimingMutex;
+ProfilePhase gCurrentProfilePhase = ProfilePhase::None;
+std::map<std::string, TimingRecord> gPrefillTimingData;
+std::map<std::string, TimingRecord> gDecodeTimingData;
+
 void signalHandler(int signal) {
   if (signal == SIGINT) {
     g_receivedSigInt = true;
@@ -60,6 +92,216 @@ constexpr long long DefaultEosToken = 151643;
 constexpr float RopeTheta = 10000.0f;
 
 using RopeFreqArray = std::array<float, HiddenSize / 2>;
+
+std::string getDefaultBuildPath() {
+#ifdef DEEPSEEKR1_EXAMPLE_BUILD_PATH
+  return std::string(DEEPSEEKR1_EXAMPLE_BUILD_PATH);
+#else
+  return "./";
+#endif
+}
+
+std::string getPythonExecutable() {
+#ifdef DEEPSEEKR1_PYTHON_EXECUTABLE
+  return std::string(DEEPSEEKR1_PYTHON_EXECUTABLE);
+#else
+  return "python3";
+#endif
+}
+
+std::string escapeJson(const std::string &value) {
+  std::ostringstream escaped;
+  for (char ch : value) {
+    switch (ch) {
+    case '\\':
+      escaped << "\\\\";
+      break;
+    case '"':
+      escaped << "\\\"";
+      break;
+    case '\n':
+      escaped << "\\n";
+      break;
+    case '\r':
+      escaped << "\\r";
+      break;
+    case '\t':
+      escaped << "\\t";
+      break;
+    default:
+      escaped << ch;
+      break;
+    }
+  }
+  return escaped.str();
+}
+
+std::string quoteShell(const std::string &value) {
+  std::string escaped;
+  escaped.reserve(value.size() + 2);
+  escaped.push_back('"');
+  for (char ch : value) {
+    if (ch == '"' || ch == '\\') {
+      escaped.push_back('\\');
+    }
+    escaped.push_back(ch);
+  }
+  escaped.push_back('"');
+  return escaped;
+}
+
+std::map<std::string, TimingRecord> &timingMapForPhase(ProfilePhase phase) {
+  return phase == ProfilePhase::Prefill ? gPrefillTimingData : gDecodeTimingData;
+}
+
+struct ScopedProfilePhase {
+  ProfilePhase previous = ProfilePhase::None;
+
+  explicit ScopedProfilePhase(ProfilePhase phase) {
+    std::lock_guard<std::mutex> lock(gTimingMutex);
+    previous = gCurrentProfilePhase;
+    gCurrentProfilePhase = phase;
+  }
+
+  ~ScopedProfilePhase() {
+    std::lock_guard<std::mutex> lock(gTimingMutex);
+    gCurrentProfilePhase = previous;
+  }
+};
+
+void record_timing(const char *opName, double durationSec) {
+  std::lock_guard<std::mutex> lock(gTimingMutex);
+  if (gCurrentProfilePhase == ProfilePhase::None || opName == nullptr) {
+    return;
+  }
+  auto &timingData = timingMapForPhase(gCurrentProfilePhase);
+  auto &record = timingData[opName];
+  record.opName = opName;
+  record.addTime(durationSec);
+}
+
+double rtclock() {
+  auto now = std::chrono::high_resolution_clock::now();
+  return std::chrono::duration<double>(now.time_since_epoch()).count();
+}
+
+void writeTimingJson(const fs::path &path,
+                     const std::map<std::string, TimingRecord> &timingData) {
+  std::ofstream file(path);
+  if (!file.is_open()) {
+    throw std::runtime_error("Failed to open timing JSON output: " +
+                             path.string());
+  }
+
+  double totalAvgMs = 0.0;
+  for (const auto &[name, record] : timingData) {
+    totalAvgMs += record.getAvgMs();
+  }
+
+  file << "{\n";
+  file << "  \"unit\": \"ms\",\n";
+  file << "  \"total_avg_ms\": " << std::fixed << std::setprecision(6)
+       << totalAvgMs << ",\n";
+  file << "  \"records\": [\n";
+
+  bool first = true;
+  for (const auto &[name, record] : timingData) {
+    if (!first) {
+      file << ",\n";
+    }
+    first = false;
+    const double avgMs = record.getAvgMs();
+    const double percentage =
+        totalAvgMs > 0.0 ? (avgMs / totalAvgMs) * 100.0 : 0.0;
+    file << "    {\n";
+    file << "      \"op_name\": \"" << escapeJson(name) << "\",\n";
+    file << "      \"avg_ms\": " << avgMs << ",\n";
+    file << "      \"min_ms\": " << record.getMinMs() << ",\n";
+    file << "      \"max_ms\": " << record.getMaxMs() << ",\n";
+    file << "      \"total_ms\": " << record.totalMs << ",\n";
+    file << "      \"calls\": " << record.calls << ",\n";
+    file << "      \"percentage\": " << percentage << "\n";
+    file << "    }";
+  }
+
+  file << "\n";
+  file << "  ]\n";
+  file << "}\n";
+}
+
+void generateProfileVisualization(const std::string &baseName) {
+  const fs::path buildDir = getDefaultBuildPath();
+  const fs::path graphJson = buildDir / (baseName + "_graph.json");
+  const fs::path profileJson = buildDir / (baseName + "_profile.json");
+  const fs::path outputDot = buildDir / (baseName + "_profile.dot");
+  const fs::path outputJson = buildDir / (baseName + "_profile_merged.json");
+  const fs::path outputHierarchySvg =
+      buildDir / (baseName + "_module_hierarchy.svg");
+  const fs::path scriptPath =
+      (fs::path(DEEPSEEKR1_EXAMPLE_PATH) / ".." / ".." / "tools" /
+       "buddy_tools" / "profile_viz" / "visualize_profile.py")
+          .lexically_normal();
+
+  if (!fs::exists(graphJson) || !fs::exists(profileJson)) {
+    llvm::errs() << "Skipping profile visualization for " << baseName
+                 << ": missing graph/profile JSON\n";
+    return;
+  }
+
+  const std::string command =
+      quoteShell(getPythonExecutable()) + " " + quoteShell(scriptPath.string()) +
+      " --graph-json " + quoteShell(graphJson.string()) + " --profile-json " +
+      quoteShell(profileJson.string()) + " --output-dot " +
+      quoteShell(outputDot.string()) + " --output-json " +
+      quoteShell(outputJson.string()) + " --output-hierarchy-svg " +
+      quoteShell(outputHierarchySvg.string()) + " --hierarchy-only" +
+      " >/dev/null 2>&1";
+
+  std::cout.flush();
+  std::cerr.flush();
+  if (std::system(command.c_str()) != 0) {
+    llvm::errs() << "Warning: failed to generate profile visualization with: "
+                 << command << "\n";
+  }
+}
+
+void persistProfileArtifacts() {
+  std::map<std::string, TimingRecord> prefillSnapshot;
+  std::map<std::string, TimingRecord> decodeSnapshot;
+  {
+    std::lock_guard<std::mutex> lock(gTimingMutex);
+    prefillSnapshot = gPrefillTimingData;
+    decodeSnapshot = gDecodeTimingData;
+  }
+
+  if (prefillSnapshot.empty() && decodeSnapshot.empty()) {
+    return;
+  }
+
+  const fs::path buildDir = getDefaultBuildPath();
+  try {
+    writeTimingJson(buildDir / "subgraph0_prefill_profile.json",
+                    prefillSnapshot);
+    writeTimingJson(buildDir / "subgraph0_decode_profile.json", decodeSnapshot);
+    generateProfileVisualization("subgraph0_prefill");
+    generateProfileVisualization("subgraph0_decode");
+    llvm::errs() << "Profile JSON: "
+                 << (buildDir / "subgraph0_prefill_profile.json").string()
+                 << "\n";
+    llvm::errs() << "Profile JSON: "
+                 << (buildDir / "subgraph0_decode_profile.json").string()
+                 << "\n";
+    llvm::errs() << "Module hierarchy SVG: "
+                 << (buildDir / "subgraph0_prefill_module_hierarchy.svg").string()
+                 << "\n";
+    llvm::errs() << "Module hierarchy SVG: "
+                 << (buildDir / "subgraph0_decode_module_hierarchy.svg").string()
+                 << "\n";
+  } catch (const std::exception &ex) {
+    llvm::errs() << "Warning: failed to persist profile artifacts: "
+                 << ex.what() << "\n";
+  }
+}
 
 struct MemRefContainer {
   MemRef<float, 4> kv0;
@@ -186,6 +428,14 @@ extern "C" void _mlir_ciface_forward_decode(
     MemRef<float, 4> *kv47, MemRef<float, 4> *kv48, MemRef<float, 4> *kv49,
     MemRef<float, 4> *kv50, MemRef<float, 4> *kv51, MemRef<float, 4> *kv52,
     MemRef<float, 4> *kv53, MemRef<float, 4> *kv54, MemRef<float, 4> *kv55);
+
+extern "C" double _mlir_ciface_rtclock() { return rtclock(); }
+
+extern "C" void _mlir_ciface_record_timing(void *opNamePtr,
+                                           double durationSec) {
+  const char *opName = reinterpret_cast<const char *>(opNamePtr);
+  record_timing(opName, durationSec);
+}
 
 static llvm::cl::opt<std::string>
     ModelPathOpt("model",
@@ -434,7 +684,7 @@ struct GenerationResult {
 
 std::string getDefaultModelPath() {
 #ifdef DEEPSEEKR1_EXAMPLE_BUILD_PATH
-  return std::string(DEEPSEEKR1_EXAMPLE_BUILD_PATH) + "arg0.data";
+  return getDefaultBuildPath() + "arg0.data";
 #else
   return "arg0.data";
 #endif
@@ -574,8 +824,11 @@ GenerationResult runGeneration(const std::string &prompt,
   getInfoStream() << "[Debug] Starting prefill execution...\n";
   const auto prefillStart = std::chrono::high_resolution_clock::now();
   // Execute prefill graph.
-  _mlir_ciface_forward_prefill(prefillPtr, &paramsContainer,
-                               &inputContainerPrefill);
+  {
+    ScopedProfilePhase profilePhase(ProfilePhase::Prefill);
+    _mlir_ciface_forward_prefill(prefillPtr, &paramsContainer,
+                                 &inputContainerPrefill);
+  }
   getInfoStream() << "[Debug] Prefill execution finished.\n";
   const auto prefillEnd = std::chrono::high_resolution_clock::now();
   const std::chrono::duration<double, std::milli> prefillMs =
@@ -675,22 +928,29 @@ GenerationResult runGeneration(const std::string &prompt,
       break;
     }
     const auto decodeStart = std::chrono::high_resolution_clock::now();
-    _mlir_ciface_forward_decode(
-        decodePtr, &paramsContainer, &inputContainerDecode, &cachePosition,
-        &decodePtr->kv0, &decodePtr->kv1, &decodePtr->kv2, &decodePtr->kv3,
-        &decodePtr->kv4, &decodePtr->kv5, &decodePtr->kv6, &decodePtr->kv7,
-        &decodePtr->kv8, &decodePtr->kv9, &decodePtr->kv10, &decodePtr->kv11,
-        &decodePtr->kv12, &decodePtr->kv13, &decodePtr->kv14, &decodePtr->kv15,
-        &decodePtr->kv16, &decodePtr->kv17, &decodePtr->kv18, &decodePtr->kv19,
-        &decodePtr->kv20, &decodePtr->kv21, &decodePtr->kv22, &decodePtr->kv23,
-        &decodePtr->kv24, &decodePtr->kv25, &decodePtr->kv26, &decodePtr->kv27,
-        &decodePtr->kv28, &decodePtr->kv29, &decodePtr->kv30, &decodePtr->kv31,
-        &decodePtr->kv32, &decodePtr->kv33, &decodePtr->kv34, &decodePtr->kv35,
-        &decodePtr->kv36, &decodePtr->kv37, &decodePtr->kv38, &decodePtr->kv39,
-        &decodePtr->kv40, &decodePtr->kv41, &decodePtr->kv42, &decodePtr->kv43,
-        &decodePtr->kv44, &decodePtr->kv45, &decodePtr->kv46, &decodePtr->kv47,
-        &decodePtr->kv48, &decodePtr->kv49, &decodePtr->kv50, &decodePtr->kv51,
-        &decodePtr->kv52, &decodePtr->kv53, &decodePtr->kv54, &decodePtr->kv55);
+    {
+      ScopedProfilePhase profilePhase(ProfilePhase::Decode);
+      _mlir_ciface_forward_decode(
+          decodePtr, &paramsContainer, &inputContainerDecode, &cachePosition,
+          &decodePtr->kv0, &decodePtr->kv1, &decodePtr->kv2, &decodePtr->kv3,
+          &decodePtr->kv4, &decodePtr->kv5, &decodePtr->kv6, &decodePtr->kv7,
+          &decodePtr->kv8, &decodePtr->kv9, &decodePtr->kv10, &decodePtr->kv11,
+          &decodePtr->kv12, &decodePtr->kv13, &decodePtr->kv14,
+          &decodePtr->kv15, &decodePtr->kv16, &decodePtr->kv17,
+          &decodePtr->kv18, &decodePtr->kv19, &decodePtr->kv20,
+          &decodePtr->kv21, &decodePtr->kv22, &decodePtr->kv23,
+          &decodePtr->kv24, &decodePtr->kv25, &decodePtr->kv26,
+          &decodePtr->kv27, &decodePtr->kv28, &decodePtr->kv29,
+          &decodePtr->kv30, &decodePtr->kv31, &decodePtr->kv32,
+          &decodePtr->kv33, &decodePtr->kv34, &decodePtr->kv35,
+          &decodePtr->kv36, &decodePtr->kv37, &decodePtr->kv38,
+          &decodePtr->kv39, &decodePtr->kv40, &decodePtr->kv41,
+          &decodePtr->kv42, &decodePtr->kv43, &decodePtr->kv44,
+          &decodePtr->kv45, &decodePtr->kv46, &decodePtr->kv47,
+          &decodePtr->kv48, &decodePtr->kv49, &decodePtr->kv50,
+          &decodePtr->kv51, &decodePtr->kv52, &decodePtr->kv53,
+          &decodePtr->kv54, &decodePtr->kv55);
+    }
     const auto decodeEnd = std::chrono::high_resolution_clock::now();
     const std::chrono::duration<double, std::milli> decodeTime =
         decodeEnd - decodeStart;
@@ -938,7 +1198,9 @@ int main(int argc, char **argv) {
         printStats(result);
       }
     }
+    persistProfileArtifacts();
   } catch (const std::exception &ex) {
+    persistProfileArtifacts();
     llvm::errs() << "Inference failed: " << ex.what() << "\n";
     return 1;
   }

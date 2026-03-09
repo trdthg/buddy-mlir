@@ -22,6 +22,9 @@
 import os
 import argparse
 import time
+import json
+import subprocess
+import sys
 import torch
 import torch._dynamo as dynamo
 from transformers import (
@@ -60,11 +63,77 @@ parser.add_argument(
     choices=["f32", "f16", "bf16"],
     help="Precision mode for generated MLIR and input data. Choose from 'f32', 'f16', or 'bf16'.",
 )
+parser.add_argument(
+    "--enable-profile",
+    action="store_true",
+    help=(
+        "Emit profiled subgraph artifacts: static graph JSON/DOT, timed MLIR, "
+        "and static SVG reports for prefill/decode."
+    ),
+)
 args = parser.parse_args()
 
 # Ensure the output directory exists.
 output_dir = args.output_dir
 os.makedirs(output_dir, exist_ok=True)
+
+VISUALIZE_PROFILE_SCRIPT = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "tools", "buddy_tools", "profile_viz", "visualize_profile.py")
+)
+
+
+def write_empty_profile_json(path: str):
+    payload = {"unit": "ms", "total_avg_ms": 0.0, "records": []}
+    with open(path, "w") as profile_file:
+        json.dump(payload, profile_file, indent=2)
+        profile_file.write("\n")
+
+
+def emit_profile_artifacts(subgraph, output_dir: str, base_name: str):
+    graph_json = os.path.join(output_dir, f"{base_name}_graph.json")
+    graph_dot = os.path.join(output_dir, f"{base_name}_graph.dot")
+    timed_mlir = os.path.join(output_dir, f"{base_name}_timed.mlir")
+    profile_json = os.path.join(output_dir, f"{base_name}_profile.json")
+    profile_dot = os.path.join(output_dir, f"{base_name}_profile.dot")
+    profile_merged_json = os.path.join(
+        output_dir, f"{base_name}_profile_merged.json"
+    )
+    hierarchy_svg = os.path.join(
+        output_dir, f"{base_name}_module_hierarchy.svg"
+    )
+
+    subgraph.enable_profile = True
+    subgraph.write_static_graph(graph_json)
+    subgraph.write_static_graph(graph_dot)
+    subgraph._imported_module = None
+    subgraph.lower_to_top_level_ir()
+    with open(timed_mlir, "w") as module_file:
+        print(subgraph._imported_module, file=module_file)
+
+    write_empty_profile_json(profile_json)
+    subprocess.run(
+        [
+            sys.executable,
+            VISUALIZE_PROFILE_SCRIPT,
+            "--graph-json",
+            graph_json,
+            "--profile-json",
+            profile_json,
+            "--output-dot",
+            profile_dot,
+            "--output-json",
+            profile_merged_json,
+            "--output-hierarchy-svg",
+            hierarchy_svg,
+            "--hierarchy-only",
+        ],
+        check=True,
+    )
+
+    print(
+        "Generated profile artifacts for "
+        f"{base_name}: {graph_json}, {timed_mlir}, {hierarchy_svg}"
+    )
 
 # Retrieve the DeepSeekR1 model path from environment variables.
 model_path = os.environ.get("DEEPSEEKR1_MODEL_PATH")
@@ -276,6 +345,13 @@ else:
 
 # Save the generated files to the specified output directory.
 if args.precision == "f16":
+    if args.enable_profile:
+        emit_profile_artifacts(
+            driver_prefill.subgraphs[0], output_dir, "subgraph0_prefill-f16"
+        )
+        emit_profile_artifacts(
+            driver_decode.subgraphs[0], output_dir, "subgraph0_decode-f16"
+        )
     with open(
         os.path.join(output_dir, "subgraph0_prefill-f16.mlir"), "w"
     ) as module_file:
@@ -298,6 +374,13 @@ if args.precision == "f16":
     ) as module_file:
         print(driver_decode.construct_main_graph(True), file=module_file)
 elif args.precision == "bf16":
+    if args.enable_profile:
+        emit_profile_artifacts(
+            driver_prefill.subgraphs[0], output_dir, "subgraph0_prefill-bf16"
+        )
+        emit_profile_artifacts(
+            driver_decode.subgraphs[0], output_dir, "subgraph0_decode-bf16"
+        )
     with open(
         os.path.join(output_dir, "subgraph0_prefill-bf16.mlir"), "w"
     ) as module_file:
@@ -325,6 +408,13 @@ elif args.precision == "bf16":
     ) as module_file:
         print(driver_decode.construct_main_graph(True), file=module_file)
 else:
+    if args.enable_profile:
+        emit_profile_artifacts(
+            driver_prefill.subgraphs[0], output_dir, "subgraph0_prefill"
+        )
+        emit_profile_artifacts(
+            driver_decode.subgraphs[0], output_dir, "subgraph0_decode"
+        )
     with open(
         os.path.join(output_dir, "subgraph0_prefill.mlir"), "w"
     ) as module_file:

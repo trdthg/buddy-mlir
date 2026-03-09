@@ -290,6 +290,7 @@ def eliminate_matmul_transpose_reshape(graph: Graph):
             # Set tensor_meta with correct output shape
             new_reshape_node.tensor_meta = transpose_node.tensor_meta.copy()
             new_reshape_node.tensor_meta["shape"] = tuple(new_shape)
+            graph.inherit_provenance(new_reshape_node, transpose_node)
             # _op_type is already set to OpType.ReshapeType by ReshapeOp constructor
             new_reshape_node._parents = [input_node_name]
             new_reshape_node._children = list(transpose_node._children)
@@ -386,6 +387,7 @@ def eliminate_matmul_transpose_reshape(graph: Graph):
             new_reshape_node.name = reshape_node.name
             new_reshape_node._arguments = [input_node_name, new_shape]
             new_reshape_node.tensor_meta = reshape_node.tensor_meta.copy()
+            graph.inherit_provenance(new_reshape_node, reshape_node)
             # _op_type is already set to OpType.ReshapeType by ReshapeOp constructor
             new_reshape_node._parents = [input_node_name]
             new_reshape_node._children = list(reshape_node._children)

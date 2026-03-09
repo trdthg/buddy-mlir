@@ -1,0 +1,22 @@
+# Generated parameter dump
+arg0.data
+
+# Generated MLIR
+forward.mlir
+subgraph0.mlir
+
+# Generated static graph artifacts
+subgraph0_graph.dot
+subgraph0_graph.json
+
+# Generated profile visualizations
+subgraph0_profile.dot
+subgraph0_profile.svg
+subgraph0_module_hierarchy.svg
+subgraph0_profile.html
+subgraph0_profile.json
+subgraph0_profile_merged.json
+
+# Import / fusion logs
+graph.log
+graph_fused.log

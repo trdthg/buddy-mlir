@@ -18,11 +18,15 @@
 #
 # ===---------------------------------------------------------------------------
 
-from typing import Any, List, Optional
+from collections.abc import Mapping
+from copy import deepcopy
+from typing import Any, Dict, List, Optional
 from types import FunctionType
 from enum import Enum, auto
 import ctypes
 import functools
+import json
+import os
 import numpy as np
 
 import buddy_mlir.ir as ir
@@ -149,6 +153,7 @@ class Graph:
         self.op_groups: Dict[str, List[Op]] = {}
         self.group_map_device: Dict[str, DeviceType] = {}
         self._enable_external_calls = enable_external_calls
+        self._source_context: Dict[str, Any] = {}
 
     @property
     def body(self):
@@ -157,6 +162,22 @@ class Graph:
     @body.setter
     def body(self, new_body):
         self._body = new_body
+
+    @property
+    def source_context(self):
+        return self._source_context
+
+    @source_context.setter
+    def source_context(self, new_source_context):
+        self._source_context = new_source_context or {}
+
+    @property
+    def enable_profile(self) -> bool:
+        return self._enable_profile
+
+    @enable_profile.setter
+    def enable_profile(self, value: bool):
+        self._enable_profile = bool(value)
 
     def add_node(self, node: Op, node_type: NodeType = NodeType.OtherNode):
         """
@@ -288,6 +309,57 @@ class Graph:
         self._body.remove(node)
         self.node_table.pop(node.name)
 
+    @staticmethod
+    def _merge_provenance_value(left, right):
+        if left in (None, {}, [], ()):
+            return deepcopy(right)
+        if right in (None, {}, [], ()):
+            return deepcopy(left)
+        if left == right:
+            return deepcopy(left)
+        if isinstance(left, dict) and isinstance(right, dict):
+            merged = deepcopy(left)
+            for key, value in right.items():
+                if key not in merged:
+                    merged[key] = deepcopy(value)
+            return merged
+        if isinstance(left, list) and isinstance(right, list):
+            merged = []
+            for item in left + right:
+                if item not in merged:
+                    merged.append(deepcopy(item))
+            return merged
+        return deepcopy(left)
+
+    def inherit_provenance(self, target: Op, *sources: Op):
+        """
+        Copy or merge provenance from source nodes into a rewritten target node.
+
+        This is the graph-level provenance propagation hook for transform
+        passes. It keeps provenance handling close to node replacement instead
+        of re-implementing it in every pass.
+        """
+        merged = {}
+        saw_any = False
+        for source in sources:
+            if source is None:
+                continue
+            provenance = getattr(source, "provenance", None) or {}
+            if not provenance:
+                continue
+            saw_any = True
+            for key, value in provenance.items():
+                if key not in merged:
+                    merged[key] = deepcopy(value)
+                else:
+                    merged[key] = self._merge_provenance_value(
+                        merged[key], value
+                    )
+
+        if not saw_any:
+            return
+        target.provenance = merged
+
     def displace_node(self, node: Op, newnode: Op):
         """
         Replaces an existing node with a new node in the graph.
@@ -303,6 +375,7 @@ class Graph:
         newnode._keyword_arguments = node.kwargs
         newnode._tensor_meta = node.tensor_meta
         newnode._op_type = node._op_type
+        self.inherit_provenance(newnode, node)
 
         for i in node._children:
             newnode.add_children(i)
@@ -335,6 +408,9 @@ class Graph:
             node (Op): The operation to be replaced.
             chain (list[Op]): The a list of nodes to be inserted instead of Op
         """
+
+        for chain_node in chain:
+            self.inherit_provenance(chain_node, node)
 
         # chain[0] is to be head of the chain:
         chain[0]._arguments = node.args
@@ -466,6 +542,267 @@ class Graph:
         """
         for transform_func in func_list:
             transform_func(self)
+
+    @staticmethod
+    def _jsonable_value(value: Any):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {
+                str(key): Graph._jsonable_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [Graph._jsonable_value(item) for item in value]
+        return str(value)
+
+    @staticmethod
+    def _normalize_profile_record(record: Any) -> Optional[Dict[str, Any]]:
+        if record is None:
+            return None
+        if isinstance(record, Mapping):
+            normalized = {
+                str(key): Graph._jsonable_value(value)
+                for key, value in record.items()
+            }
+            if "avg_ms" not in normalized:
+                if "time_ms" in normalized:
+                    normalized["avg_ms"] = normalized["time_ms"]
+                elif "avg" in normalized:
+                    normalized["avg_ms"] = normalized["avg"]
+                elif "duration_sec" in normalized:
+                    normalized["avg_ms"] = normalized["duration_sec"] * 1000.0
+            if "min_ms" not in normalized and "min" in normalized:
+                normalized["min_ms"] = normalized["min"]
+            if "max_ms" not in normalized and "max" in normalized:
+                normalized["max_ms"] = normalized["max"]
+            return normalized
+        return {"avg_ms": Graph._jsonable_value(record)}
+
+    def _profile_label_width(self) -> int:
+        return max(1, len(str(len(self._body))))
+
+    def get_profile_symbol(self, node: int | str | Op) -> str:
+        """
+        Returns the profiling symbol name injected by `enable_profile`.
+
+        The format matches commit `51cef718918432dcdc49be5e7949e80e2aa71002`:
+        `op_name_{node_index}_{node_name}`.
+        """
+        if isinstance(node, int):
+            node_index = node
+            graph_node = self._body[node_index]
+        else:
+            node_name = node.name if isinstance(node, Op) else str(node)
+            graph_node = None
+            for index, candidate in enumerate(self._body):
+                if candidate.name == node_name:
+                    node_index = index
+                    graph_node = candidate
+                    break
+            if graph_node is None:
+                raise KeyError(f"Node {node_name} not found in graph")
+        width = self._profile_label_width()
+        return f"op_name_{node_index:0{width}d}_{graph_node.name}"
+
+    def _lookup_profile_record(
+        self,
+        profile_data: Optional[Mapping[str, Any]],
+        node: Op,
+        profile_symbol: str,
+    ) -> Optional[Dict[str, Any]]:
+        if profile_data is None:
+            return None
+        record = profile_data.get(profile_symbol)
+        if record is None:
+            record = profile_data.get(node.name)
+        return self._normalize_profile_record(record)
+
+    def to_static_graph(
+        self, profile_data: Optional[Mapping[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Export the Buddy graph to a stable JSON-serializable DAG structure.
+
+        When `profile_data` is provided, records are matched first by the
+        injected profiling symbol and then by raw node name.
+        """
+        nodes = []
+        edges = []
+        latest_node_id_by_name = {}
+        for index, node in enumerate(self._body):
+            profile_symbol = self.get_profile_symbol(index)
+            node_record = self._lookup_profile_record(
+                profile_data, node, profile_symbol
+            )
+            tensor_meta = node.tensor_meta
+            if isinstance(tensor_meta, TensorMeta):
+                shape = tensor_meta.shape
+                dtype = tensor_meta.dtype
+            else:
+                shape = tensor_meta.get("shape")
+                dtype = tensor_meta.get("dtype")
+            nodes.append(
+                {
+                    "id": index,
+                    "name": node.name,
+                    "profile_name": profile_symbol,
+                    "kind": type(node).__name__,
+                    "op_type": (
+                        node._op_type.name if node._op_type is not None else None
+                    ),
+                    "shape": self._jsonable_value(shape),
+                    "dtype": self._jsonable_value(dtype),
+                    "arguments": self._jsonable_value(node.args),
+                    "kwargs": self._jsonable_value(node.kwargs),
+                    "parents": self._jsonable_value(node._parents),
+                    "children": self._jsonable_value(node._children),
+                    "provenance": self._jsonable_value(
+                        getattr(node, "provenance", None)
+                    ),
+                    "profile": node_record,
+                }
+            )
+            for parent_name in dict.fromkeys(node._parents):
+                edge = {"source": parent_name, "target": node.name}
+                parent_id = latest_node_id_by_name.get(parent_name)
+                if parent_id is not None:
+                    edge["source_id"] = parent_id
+                    edge["target_id"] = index
+                edges.append(edge)
+            latest_node_id_by_name[node.name] = index
+
+        return {
+            "func_name": self._func_name,
+            "device": self.device.value,
+            "profile_enabled": self._enable_profile,
+            "source_context": self._jsonable_value(self._source_context),
+            "profile_name_format": "op_name_{node_index}_{node_name}",
+            "node_count": len(nodes),
+            "nodes": nodes,
+            "edges": edges,
+        }
+
+    @staticmethod
+    def _dot_escape(text: Any) -> str:
+        return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+    @staticmethod
+    def _interpolate_color(
+        start: tuple[int, int, int],
+        end: tuple[int, int, int],
+        ratio: float,
+    ) -> str:
+        ratio = max(0.0, min(1.0, ratio))
+        channels = [
+            round(start[index] + (end[index] - start[index]) * ratio)
+            for index in range(3)
+        ]
+        return "#{:02x}{:02x}{:02x}".format(*channels)
+
+    def to_dot(self, profile_data: Optional[Mapping[str, Any]] = None) -> str:
+        """
+        Render the static graph as Graphviz DOT.
+        """
+        static_graph = self.to_static_graph(profile_data)
+        profiled_nodes = [
+            node
+            for node in static_graph["nodes"]
+            if (
+                node["profile"] is not None
+                and node["profile"].get("avg_ms") is not None
+            )
+        ]
+        max_avg_ms = max(
+            (float(node["profile"]["avg_ms"]) for node in profiled_nodes),
+            default=0.0,
+        )
+        lines = [
+            "digraph buddy_graph {",
+            '  rankdir="LR";',
+            '  graph [fontname="Helvetica"];',
+            '  node [shape="box", style="rounded,filled", fontname="Helvetica", fillcolor="#f5f5f4"];',
+            '  edge [fontname="Helvetica"];',
+        ]
+
+        for node in static_graph["nodes"]:
+            label_lines = [
+                f'{node["id"]}: {node["name"]}',
+                node["kind"],
+            ]
+            if node["op_type"] is not None:
+                label_lines.append(f'op_type={node["op_type"]}')
+            if node["shape"] is not None:
+                label_lines.append(f'shape={node["shape"]}')
+            if node["dtype"] is not None:
+                label_lines.append(f'dtype={node["dtype"]}')
+            if node["profile"] is not None:
+                avg_ms = node["profile"].get("avg_ms")
+                if avg_ms is not None:
+                    label_lines.append(f"avg_ms={float(avg_ms):.4f}")
+                percentage = node["profile"].get("percentage")
+                if percentage is not None:
+                    label_lines.append(f"pct={float(percentage):.2f}%")
+            fillcolor = "#f5f5f4"
+            if (
+                node["profile"] is not None
+                and node["profile"].get("avg_ms") is not None
+                and max_avg_ms > 0.0
+            ):
+                fillcolor = self._interpolate_color(
+                    (243, 244, 246),
+                    (239, 68, 68),
+                    float(node["profile"]["avg_ms"]) / max_avg_ms,
+                )
+            label = "\\n".join(self._dot_escape(line) for line in label_lines)
+            lines.append(
+                f'  n{node["id"]} [label="{label}", fillcolor="{fillcolor}"];'
+            )
+
+        node_ids = {
+            node["name"]: node["id"] for node in static_graph["nodes"]
+        }
+        for edge in static_graph["edges"]:
+            src_id = node_ids.get(edge["source"])
+            dst_id = node_ids.get(edge["target"])
+            if src_id is None or dst_id is None:
+                continue
+            lines.append(f"  n{src_id} -> n{dst_id};")
+
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+
+    def write_static_graph(
+        self,
+        path: str | os.PathLike[str],
+        profile_data: Optional[Mapping[str, Any]] = None,
+        fmt: Optional[str] = None,
+    ) -> None:
+        """
+        Write the static graph as JSON or DOT.
+
+        The output format defaults to the file suffix.
+        """
+        output_path = os.fspath(path)
+        if fmt is None:
+            _, suffix = os.path.splitext(output_path)
+            fmt = suffix.lstrip(".").lower() or "json"
+        with open(output_path, "w") as output_file:
+            if fmt == "json":
+                json.dump(
+                    self.to_static_graph(profile_data),
+                    output_file,
+                    indent=2,
+                )
+                output_file.write("\n")
+            elif fmt == "dot":
+                output_file.write(self.to_dot(profile_data))
+            else:
+                raise ValueError(f"Unsupported static graph format: {fmt}")
 
     def lower_to_top_level_ir(self):
         """

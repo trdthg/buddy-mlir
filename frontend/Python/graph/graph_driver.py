@@ -128,6 +128,7 @@ class GraphDriver:
                 subgraph_device,
                 verbose=self._graph._verbose,
             )
+            subgraph.source_context = self._graph.source_context
 
             # Construct input placeholder nodes
             for inp in subgraphs_inputs[subgraph_name]:
@@ -216,6 +217,7 @@ class GraphDriver:
             func_name=self._graph._func_name,
             verbose=self._graph._verbose,
         )
+        main_graph.source_context = self._graph.source_context
 
         # Adding placeholder operations from the original graph
         for op in self._graph.params:

@@ -20,14 +20,7 @@ echo "Buddy-MLIR Root: $BUDDY_ROOT"
 echo "Build Directory: $BUILD_DIR"
 echo ""
 
-# Step 1: Generate MLIR files and parameters
-echo "Generating MLIR files and parameters..."
-cd "$SCRIPT_DIR"
-python import-transformer.py --output-dir ./
-echo "✓ Generated forward.mlir, subgraph0.mlir, arg0.data"
-echo ""
-
-# Step 2: Reconfigure CMake to pick up new targets
+# Step 1: Reconfigure CMake to pick up new targets
 echo "Reconfiguring CMake..."
 cd "$BUILD_DIR"
 cmake .. -G Ninja \
@@ -36,23 +29,18 @@ cmake .. -G Ninja \
 echo "✓ CMake reconfigured"
 echo ""
 
-# Step 3: Build the project
+# Step 2: Build the project
 echo "Building the project..."
 ninja buddy-transformer-timed-executable
 echo "✓ Build completed"
 echo ""
 
-# Step 4: Copy parameters to build directory
-echo "Copying parameters to build directory..."
-cp "$SCRIPT_DIR/arg0.data" "$BUILD_DIR/examples/BuddyTransformer/"
-echo "✓ Parameters copied"
-echo ""
-
-# Step 5: Run the timed executable
+# Step 3: Run the timed executable
 echo "Running timed transformer executable..."
 echo "========================================="
 echo ""
 "$BUILD_DIR/bin/transformer-runner-timed"
-
-
-
+echo ""
+echo "✓ Generated profile artifacts during execution"
+echo "  Full heatmap: $BUILD_DIR/examples/BuddyTransformer/subgraph0_profile.svg"
+echo "  Module drill-down: $BUILD_DIR/examples/BuddyTransformer/subgraph0_module_hierarchy.svg"

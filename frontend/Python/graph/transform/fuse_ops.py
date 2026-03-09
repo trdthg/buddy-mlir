@@ -81,6 +81,7 @@ def transpose_matmul_fusion(
     # matmulop -> fusedmatmulopnode
     fused_op.name = "fused" + node.name
     graph.displace_node(node, fused_op)
+    graph.inherit_provenance(fused_op, node, target)
     fused_op.args.pop(fused_op.args.index(target.name))
     fused_op._parents.pop(fused_op._parents.index(target.name))
     fused_op.args.extend(target.args)
@@ -168,6 +169,7 @@ def replace_attention_op(graph: Graph):
             )()
             new_op.name = "FlashAttentionForCpuPrefillOp"
             graph.displace_node(op, new_op)
+            graph.inherit_provenance(new_op, op)
 
 
 def gqa_attention_fusion(graph: Graph):
@@ -279,6 +281,18 @@ def replace_gqa_attention_with_fused_op(
 
     # replace SDPA node with GQAAttentionFusedOp
     graph.displace_node(sdpa_node, fused_op)
+    graph.inherit_provenance(
+        fused_op,
+        sdpa_node,
+        k_view,
+        k_clone,
+        k_expand,
+        k_cache_unsqueeze,
+        v_view,
+        v_clone,
+        v_expand,
+        v_cache_unsqueeze,
+    )
 
     # clear old KV View input inherited by SDPA
     # assume sdpa_node.args[0] is Query, keep unchanged

@@ -7,8 +7,12 @@ This example demonstrates how to use Buddy Compiler to compile a complete DeepSe
 - `transformer_model.py`: DeepSeek R1 transformer block PyTorch model definition
 - `import-transformer.py`: Frontend script to convert PyTorch model to MLIR
 - `transformer_runner.cpp`: C++ performance test runner
+- `../../tools/buddy_tools/profile_viz/visualize_profile.py`: Merge static graph JSON with timing JSON and emit DOT/SVG reports
 - `CMakeLists.txt`: Build configuration for compilation
 - `README.md`: This documentation
+
+Design notes for the profiling and visualization stack:
+- [`docs/profile-visualization.md`](../../docs/profile-visualization.md)
 
 ## Model Configuration
 - Hidden size: 1536
@@ -89,6 +93,27 @@ After building, run the performance test:
 ./bin/transformer-runner
 ```
 
+For operator-level profiling with graph visualization:
+```bash
+./bin/transformer-runner-timed
+```
+
+The runner automatically writes timing JSON and renders:
+- `subgraph0_profile.dot`
+- `subgraph0_profile.svg`
+- `subgraph0_module_hierarchy.svg`
+
+If you want to rerender manually after editing `tools/buddy_tools/profile_viz/visualize_profile.py`:
+```bash
+python3 ../tools/buddy_tools/profile_viz/visualize_profile.py \
+  --graph-json examples/BuddyTransformer/subgraph0_graph.json \
+  --profile-json examples/BuddyTransformer/subgraph0_profile.json
+```
+
+Recommended inspection order:
+- Open `subgraph0_module_hierarchy.svg` first for module-level drill-down
+- Open `subgraph0_profile.svg` when you need the full flat heatmap DAG
+
 ## Generated Files
 
 After building, the following files will be generated in the build directory:
@@ -96,8 +121,10 @@ After building, the following files will be generated in the build directory:
 ### Frontend Output (PyTorch to MLIR)
 - `graph.log`: Buddy Graph representation before lowering to TOSA
 - `graph_fused.log`: Buddy Graph representation after fusion optimization
+- `subgraph0_graph.json`: Static DAG export with stable node/profile IDs
+- `subgraph0_graph.dot`: Graphviz DOT export of the static DAG
 - `forward.mlir`: Main graph MLIR representation
-- `subgraph0.mlir`: Subgraph MLIR representation
+- `subgraph0_timed.mlir`: Auto-instrumented subgraph MLIR with `rtclock/record_timing`
 - `arg0.data`: Model parameters in binary format
 
 ### Midend Output (Optimized MLIR)
@@ -114,6 +141,10 @@ After building, the following files will be generated in the build directory:
 - `forward.o`: Forward graph object file
 - `subgraph.o`: Subgraph object file
 - `transformer-runner`: Final executable
+- `subgraph0_profile.json`: Runtime operator timing dump keyed by profiling symbol
+- `subgraph0_profile.dot`: Annotated DOT file generated after merging graph + profile
+- `subgraph0_profile.svg`: Graphviz-rendered heatmap graph
+- `subgraph0_module_hierarchy.svg`: Single-file clickable module hierarchy SVG with drill-down
 
 ## Compilation Modes
 
@@ -122,7 +153,7 @@ After building, the following files will be generated in the build directory:
 **Stage 1: Frontend (PyTorch → TOSA)**
 - Target: `buddy-transformer-frontend`
 - Converts PyTorch model to TOSA dialect MLIR representation
-- Outputs: `forward.mlir`, `subgraph0.mlir`, `arg0.data`
+- Outputs: `forward.mlir`, `subgraph0_timed.mlir`, `subgraph0_graph.json`, `arg0.data`
 
 **Stage 2: Midend (TOSA → Optimized MLIR)**
 - Target: `buddy-transformer-midend`

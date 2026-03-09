@@ -88,6 +88,7 @@ class Op:
         self._children: List[str] = []
         self._parents: List[str] = []
         self._args_index = []
+        self._provenance: Dict = {}
 
     def add_argument(self, arg, arg_index=0):
         """
@@ -143,6 +144,14 @@ class Op:
     @tensor_meta.setter
     def tensor_meta(self, new_tensor_meta):
         self._tensor_meta = new_tensor_meta
+
+    @property
+    def provenance(self):
+        return self._provenance
+
+    @provenance.setter
+    def provenance(self, new_provenance):
+        self._provenance = new_provenance
 
 
 class PlaceholderOp(Op):

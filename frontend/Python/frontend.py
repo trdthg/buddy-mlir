@@ -111,6 +111,7 @@ class DynamoCompiler:
         self._ops_registry = {}
         self._imported_params = {}
         self._model_config = type("Config", (), {"decode_with_cache": False})
+        self._source_context: Dict[str, Any] = {}
         self._ops_registry.update(math_ops_registry)
         self._ops_registry.update(linalg_ops_registry)
         self._ops_registry.update(tosa_ops_registry)
@@ -766,6 +767,59 @@ class DynamoCompiler:
                     out_kwarg_names.append(arg.name)
         return out_kwarg_names
 
+    @staticmethod
+    def _stringify_meta_stack(value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): DynamoCompiler._stringify_meta_stack(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [
+                DynamoCompiler._stringify_meta_stack(item) for item in value
+            ]
+        return str(value)
+
+    def _build_node_provenance(self, gm_node: torch.fx.Node) -> Dict[str, Any]:
+        target = getattr(gm_node, "target", None)
+        target_name = None
+        if callable(target):
+            target_name = getattr(target, "__name__", None)
+        if target_name is None and target is not None:
+            target_name = str(target)
+
+        return {
+            "origin_ids": [f"fx:{self._func_name}:{gm_node.name}"],
+            "fx_node_name": gm_node.name,
+            "fx_node_op": gm_node.op,
+            "torch_target": target_name,
+            "stack_trace": gm_node.meta.get("stack_trace") or None,
+            "nn_module_stack": self._stringify_meta_stack(
+                gm_node.meta.get("nn_module_stack")
+            ),
+            "source_fn_stack": self._stringify_meta_stack(
+                gm_node.meta.get("source_fn_stack")
+            ),
+        }
+
+    @staticmethod
+    def _build_source_context(model) -> Dict[str, Any]:
+        model_class = type(model)
+        qualname = getattr(model_class, "__qualname__", model_class.__name__)
+        return {
+            "entry_module_class": (
+                f"{model_class.__module__}.{qualname}"
+                if getattr(model_class, "__module__", None)
+                else qualname
+            ),
+            "entry_module_name": model_class.__name__,
+            "entry_module_qualname": qualname,
+        }
+
     def _create_node(
         self,
         gm_node_name: str,
@@ -775,6 +829,7 @@ class DynamoCompiler:
         node_output_shape: list = [],
         node_output_dtype: TensorDType = None,
         node_kwargs: Optional[Dict] = None,
+        provenance: Optional[Dict] = None,
     ):
         """
         Create buddy op node from torch aten op.
@@ -791,6 +846,8 @@ class DynamoCompiler:
         op_class = self._ops_map[gm_node_name]
         buddy_node = op_class()
         buddy_node._name = node_name
+        if provenance is not None:
+            buddy_node.provenance = provenance
         if gm_node_name == "output":
             for input_arg in node_input[0]:
                 if input_arg is None:
@@ -882,6 +939,7 @@ class DynamoCompiler:
                 self._enable_profile,
                 self._enable_external_calls,
             )
+            graph.source_context = self._source_context
             graph._params_ref = params_flat
             param_nodes = []
             buffers_nodes = []
@@ -906,6 +964,7 @@ class DynamoCompiler:
 
             for node_type, gm_nodes_sublist in gm_nodes:
                 for gm_node in gm_nodes_sublist:
+                    provenance = self._build_node_provenance(gm_node)
                     node_users = []
                     for user in gm_node.users.keys():
                         node_users.append(str(user))
@@ -928,11 +987,16 @@ class DynamoCompiler:
                             node_users,
                             gm_node.meta["tensor_meta"].shape,
                             node_dtype,
+                            provenance=provenance,
                         )
 
                     elif gm_node.op == "output":
                         buddy_node = self._create_node(
-                            gm_node.op, gm_node.name, gm_node.args, node_users
+                            gm_node.op,
+                            gm_node.name,
+                            gm_node.args,
+                            node_users,
+                            provenance=provenance,
                         )
 
                     elif gm_node.target is operator.getitem:
@@ -946,6 +1010,7 @@ class DynamoCompiler:
                             node_users,
                             gm_node.meta["tensor_meta"].shape,
                             node_dtype,
+                            provenance=provenance,
                         )
                     elif gm_node.op == "get_attr":
                         if "_tensor_constant" in gm_node.name:
@@ -988,6 +1053,7 @@ class DynamoCompiler:
                                 node_shape,
                                 node_dtype,
                                 node_kwargs=gm_node.kwargs,
+                                provenance=provenance,
                             )
                     else:
                         tensor_meta = gm_node.meta.get("tensor_meta")
@@ -1035,6 +1101,7 @@ class DynamoCompiler:
                             node_shape,
                             node_dtype,
                             node_kwargs=gm_node.kwargs,
+                            provenance=provenance,
                         )
                         buddy_node._torch_op = str(gm_node.target.__name__)
                         buddy_node._torch_out_kwarg_names = (
@@ -1104,6 +1171,7 @@ class DynamoCompiler:
             self._model_config = model.config.__class__.from_dict(
                 model.config.to_dict()
             )
+        self._source_context = self._build_source_context(model)
         if (
             "use_cache" in kwargs
             and kwargs["use_cache"]
@@ -1171,6 +1239,7 @@ class DynamoCompiler:
         Returns:
             imported_graphs: The imported buddy graphs.
         """
+        self._source_context = self._build_source_context(module)
         exported_program = torch.export.export(module, args, kwargs)
         self._compile_fx(exported_program.graph_module, list(args))
         return self._imported_graphs

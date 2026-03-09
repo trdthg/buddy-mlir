@@ -176,12 +176,27 @@ def main():
             print("-" * 40, file=fused_file)
 
     driver = GraphDriver(graphs[0])
-    driver.subgraphs[0].lower_to_top_level_ir()
+    subgraph = driver.subgraphs[0]
+    subgraph.enable_profile = True
 
-    # Save the generated files to the specified output directory
-    # Save MLIR files
-    with open(os.path.join(output_dir, "subgraph0.mlir"), "w") as module_file:
-        print(driver.subgraphs[0]._imported_module, file=module_file)
+    # When profiling is enabled, emit the static graph so the runner can merge
+    # timing data into the final SVG automatically.
+    if subgraph.enable_profile:
+        subgraph.write_static_graph(
+            os.path.join(output_dir, "subgraph0_graph.json")
+        )
+        subgraph.write_static_graph(
+            os.path.join(output_dir, "subgraph0_graph.dot")
+        )
+
+    subgraph._imported_module = None
+    subgraph.lower_to_top_level_ir()
+
+    # Save the generated files to the specified output directory.
+    with open(
+        os.path.join(output_dir, "subgraph0_timed.mlir"), "w"
+    ) as module_file:
+        print(subgraph._imported_module, file=module_file)
     with open(os.path.join(output_dir, "forward.mlir"), "w") as module_file:
         print(driver.construct_main_graph(True), file=module_file)
 
@@ -192,7 +207,10 @@ def main():
     all_param.tofile(os.path.join(output_dir, "arg0.data"))
 
     print(f"Generated f32 MLIR files and parameters in {output_dir}")
-    print(f"Generated Buddy Graph logs: graph.log and graph_fused.log")
+    print(
+        "Generated Buddy Graph artifacts: graph.log, graph_fused.log, "
+        "subgraph0_graph.json, subgraph0_graph.dot and subgraph0_timed.mlir"
+    )
 
     # Print summary information
     print(f"Model parameters: {sum(p.numel() for p in params)} elements")

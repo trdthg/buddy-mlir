@@ -1,11 +1,14 @@
 # Frontend: Generate MLIR files from PyTorch model
 add_custom_command(
   OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/forward.mlir
-         ${CMAKE_CURRENT_BINARY_DIR}/subgraph0.mlir
+         ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_timed.mlir
+         ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_graph.json
+         ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_graph.dot
          ${CMAKE_CURRENT_BINARY_DIR}/arg0.data
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-transformer.py
           --output-dir ${CMAKE_CURRENT_BINARY_DIR}
-  COMMENT "Generating forward.mlir, subgraph0.mlir and arg0.data..."
+  DEPENDS python-package-buddy
+  COMMENT "Generating transformer MLIR, static graph artifacts and arg0.data..."
 )
 
 # One-step compilation
@@ -57,7 +60,7 @@ add_custom_command(
 # Subgraph: One-step compilation to object file
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/subgraph-onestep.o
-    COMMAND ${LLVM_TOOLS_BINARY_DIR}/mlir-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0.mlir
+    COMMAND ${LLVM_TOOLS_BINARY_DIR}/mlir-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_timed.mlir
               -pass-pipeline "builtin.module(func.func(tosa-to-linalg-named),func.func(tosa-to-linalg),func.func(tosa-to-tensor),func.func(tosa-to-arith))" |
             ${BUDDY_BINARY_DIR}/buddy-opt
             -eliminate-empty-tensors
@@ -95,14 +98,14 @@ add_custom_command(
           ${LLVM_TOOLS_BINARY_DIR}/llvm-as |
           ${LLVM_TOOLS_BINARY_DIR}/llc -filetype=obj -relocation-model=pic -O3
             -o ${CMAKE_CURRENT_BINARY_DIR}/subgraph-onestep.o
-    DEPENDS buddy-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0.mlir
-    COMMENT "Building subgraph-onestep.o (one-step compilation)"
+    DEPENDS buddy-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_timed.mlir
+    COMMENT "Building subgraph-onestep.o (one-step compilation, profiled subgraph)"
     VERBATIM)
 
 # Subgraph Timed: One-step compilation with timing instrumentation
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/subgraph-timed.o
-    COMMAND ${LLVM_TOOLS_BINARY_DIR}/mlir-opt ${CMAKE_CURRENT_SOURCE_DIR}/subgraph0_timed.mlir
+    COMMAND ${LLVM_TOOLS_BINARY_DIR}/mlir-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_timed.mlir
               -pass-pipeline "builtin.module(func.func(tosa-to-linalg-named),func.func(tosa-to-linalg),func.func(tosa-to-tensor),func.func(tosa-to-arith))" |
             ${BUDDY_BINARY_DIR}/buddy-opt
             -eliminate-empty-tensors
@@ -140,7 +143,7 @@ add_custom_command(
           ${LLVM_TOOLS_BINARY_DIR}/llvm-as |
           ${LLVM_TOOLS_BINARY_DIR}/llc -filetype=obj -relocation-model=pic -O3
             -o ${CMAKE_CURRENT_BINARY_DIR}/subgraph-timed.o
-    DEPENDS buddy-opt ${CMAKE_CURRENT_SOURCE_DIR}/subgraph0_timed.mlir
+    DEPENDS buddy-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_timed.mlir
     COMMENT "Building subgraph-timed.o (with timing instrumentation)"
     VERBATIM)
 
@@ -218,7 +221,7 @@ add_custom_command(
 # Subgraph: Midend optimization
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/subgraph0-midend.mlir
-    COMMAND ${LLVM_TOOLS_BINARY_DIR}/mlir-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0.mlir
+    COMMAND ${LLVM_TOOLS_BINARY_DIR}/mlir-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_timed.mlir
               -pass-pipeline "builtin.module(func.func(tosa-to-linalg-named),func.func(tosa-to-linalg),func.func(tosa-to-tensor),func.func(tosa-to-arith))" |
             ${BUDDY_BINARY_DIR}/buddy-opt
             -eliminate-empty-tensors
@@ -241,8 +244,8 @@ add_custom_command(
             -memref-expand
             -arith-expand
           -o ${CMAKE_CURRENT_BINARY_DIR}/subgraph0-midend.mlir
-    DEPENDS buddy-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0.mlir
-    COMMENT "Building subgraph0-midend.mlir (midend optimization)"
+    DEPENDS buddy-opt ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_timed.mlir
+    COMMENT "Building subgraph0-midend.mlir (midend optimization, profiled subgraph)"
     VERBATIM)
 
 # Subgraph: Backend lowering
@@ -323,7 +326,9 @@ target_link_libraries(transformer-runner-staged ${BUDDY_TRANSFORMER_LIBS})
 # Create targets for building the MLIR files
 add_custom_target(buddy-transformer-frontend
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/forward.mlir
-            ${CMAKE_CURRENT_BINARY_DIR}/subgraph0.mlir
+            ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_timed.mlir
+            ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_graph.json
+            ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_graph.dot
             ${CMAKE_CURRENT_BINARY_DIR}/arg0.data
     COMMENT "Building frontend MLIR files (PyTorch to TOSA)"
 )
@@ -454,7 +459,6 @@ add_dependencies(transformer-runner-timed buddy-transformer-timed-codegen)
 add_custom_target(buddy-transformer-clean
     COMMAND ${CMAKE_COMMAND} -E remove -f
         ${CMAKE_CURRENT_BINARY_DIR}/forward.mlir
-        ${CMAKE_CURRENT_BINARY_DIR}/subgraph0.mlir
         ${CMAKE_CURRENT_BINARY_DIR}/arg0.data
         ${CMAKE_CURRENT_BINARY_DIR}/forward-midend.mlir
         ${CMAKE_CURRENT_BINARY_DIR}/subgraph0-midend.mlir
@@ -467,6 +471,14 @@ add_custom_target(buddy-transformer-clean
         ${CMAKE_CURRENT_BINARY_DIR}/forward-onestep.o
         ${CMAKE_CURRENT_BINARY_DIR}/subgraph-onestep.o
         ${CMAKE_CURRENT_BINARY_DIR}/subgraph-timed.o
+        ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_timed.mlir
+        ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_graph.json
+        ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_graph.dot
+        ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_profile.json
+        ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_profile.dot
+        ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_profile.svg
+        ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_module_hierarchy.svg
+        ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_profile_merged.json
         ${CMAKE_CURRENT_BINARY_DIR}/graph.log
         ${CMAKE_CURRENT_BINARY_DIR}/graph_fused.log
     COMMAND ${CMAKE_COMMAND} -E remove -f

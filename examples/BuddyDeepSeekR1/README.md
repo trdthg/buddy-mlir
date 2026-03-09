@@ -4,6 +4,9 @@
 
 This example shows how to use Buddy Compiler to compile a DeepSeekR1 model to MLIR code then run it.
 
+For the profiling/visualization design and current hierarchy SVG behavior, see:
+- [`docs/profile-visualization.md`](../../docs/profile-visualization.md)
+
 ## How to run on non-RISC-V device
 
 0. Enter Python virtual environment.

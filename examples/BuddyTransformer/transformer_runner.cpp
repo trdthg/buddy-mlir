@@ -21,6 +21,7 @@
 #include <buddy/Core/Container.h>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -28,6 +29,7 @@
 #include <map>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -137,6 +139,95 @@ void print_timing_report() {
 // Clear timing data (for warmup)
 void clear_timing_data() {
   g_timing_data.clear();
+}
+
+std::string escapeJson(const std::string &value) {
+  std::ostringstream escaped;
+  for (char ch : value) {
+    switch (ch) {
+    case '\\':
+      escaped << "\\\\";
+      break;
+    case '"':
+      escaped << "\\\"";
+      break;
+    case '\n':
+      escaped << "\\n";
+      break;
+    case '\r':
+      escaped << "\\r";
+      break;
+    case '\t':
+      escaped << "\\t";
+      break;
+    default:
+      escaped << ch;
+      break;
+    }
+  }
+  return escaped.str();
+}
+
+void write_timing_json(const std::string &path) {
+  std::ofstream file(path);
+  if (!file) {
+    throw std::runtime_error("Cannot open timing JSON output: " + path);
+  }
+
+  double total_avg_ms = 0.0;
+  for (const auto &[name, record] : g_timing_data) {
+    total_avg_ms += record.get_avg();
+  }
+
+  file << "{\n";
+  file << "  \"unit\": \"ms\",\n";
+  file << "  \"total_avg_ms\": " << std::fixed << std::setprecision(6)
+       << total_avg_ms << ",\n";
+  file << "  \"records\": [\n";
+
+  bool first = true;
+  for (const auto &[name, record] : g_timing_data) {
+    if (!first) {
+      file << ",\n";
+    }
+    first = false;
+    double avg_ms = record.get_avg();
+    double percentage =
+        (total_avg_ms > 0.0) ? (avg_ms / total_avg_ms * 100.0) : 0.0;
+    file << "    {\n";
+    file << "      \"op_name\": \"" << escapeJson(name) << "\",\n";
+    file << "      \"avg_ms\": " << avg_ms << ",\n";
+    file << "      \"min_ms\": " << record.get_min() << ",\n";
+    file << "      \"max_ms\": " << record.get_max() << ",\n";
+    file << "      \"total_ms\": " << record.get_total() << ",\n";
+    file << "      \"calls\": " << record.times_ms.size() << ",\n";
+    file << "      \"percentage\": " << percentage << "\n";
+    file << "    }";
+  }
+
+  file << "\n";
+  file << "  ]\n";
+  file << "}\n";
+}
+
+void generate_profile_visualizations() {
+  const std::string buildDir = BUDDY_TRANSFORMER_EXAMPLE_BUILD_PATH;
+  const std::string scriptPath =
+      std::string(BUDDY_TRANSFORMER_EXAMPLE_PATH) + "/../../tools/buddy_tools/profile_viz/visualize_profile.py";
+  const std::string graphJsonPath = buildDir + "/subgraph0_graph.json";
+  const std::string profileJsonPath = buildDir + "/subgraph0_profile.json";
+  const std::string command = "python3 \"" + scriptPath + "\""
+                              + " --graph-json \"" + graphJsonPath + "\""
+                              + " --profile-json \"" + profileJsonPath + "\""
+                              + " >/dev/null 2>&1";
+
+  std::cout.flush();
+  std::cerr.flush();
+  const int status = std::system(command.c_str());
+  if (status != 0) {
+    std::cerr << "Warning: failed to generate profile visualizations with: "
+              << command << "\n";
+  }
 }
 
 // ===== End of Timing Infrastructure =====
@@ -340,6 +431,20 @@ int main(int argc, char **argv) {
 
     // Print detailed operator timing report
     print_timing_report();
+    const std::string timingJsonPath =
+        std::string(BUDDY_TRANSFORMER_EXAMPLE_BUILD_PATH) +
+        "/subgraph0_profile.json";
+    write_timing_json(timingJsonPath);
+    std::cout << "Timing JSON: " << timingJsonPath << "\n";
+    generate_profile_visualizations();
+    std::cout << "Profile SVG: "
+              << std::string(BUDDY_TRANSFORMER_EXAMPLE_BUILD_PATH) +
+                     "/subgraph0_profile.svg"
+              << "\n";
+    std::cout << "Module hierarchy SVG: "
+              << std::string(BUDDY_TRANSFORMER_EXAMPLE_BUILD_PATH) +
+                     "/subgraph0_module_hierarchy.svg"
+              << "\n";
 
     // Verify output (basic sanity check)
     float *output_data = output.getData();
