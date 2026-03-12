@@ -4212,6 +4212,7 @@ def flash_attention_for_cpu_prefill_op(
     dtype_qkv = mlir_element_type_get(dtype_qkv)
     # Use f32 for all intermediate computation (numerical stability)
     dtype = f32
+    i32 = ir.IntegerType.get_signless(32)
     need_cast = dtype_qkv != dtype
     vector_width = 16
     v16 = ir.VectorType.get([vector_width], dtype)
@@ -4237,8 +4238,83 @@ def flash_attention_for_cpu_prefill_op(
 
     zero = arith.ConstantOp(dtype, 0.0, loc=loc).result
     neg_inf = arith.ConstantOp(dtype, -1.0e30, loc=loc).result
+    exp_clamp_min = arith.ConstantOp(dtype, -80.0, loc=loc).result
+    exp_ln2 = arith.ConstantOp(dtype, float(numpy.log(2.0)), loc=loc).result
+    exp_inv_ln2 = arith.ConstantOp(
+        dtype, float(1.0 / numpy.log(2.0)), loc=loc
+    ).result
+    exp_c0 = arith.ConstantOp(dtype, 1.0, loc=loc).result
+    exp_c1 = arith.ConstantOp(dtype, 1.0, loc=loc).result
+    exp_c2 = arith.ConstantOp(dtype, 0.5, loc=loc).result
+    exp_c3 = arith.ConstantOp(dtype, 1.0 / 6.0, loc=loc).result
+    exp_c4 = arith.ConstantOp(dtype, 1.0 / 24.0, loc=loc).result
+    exp_c5 = arith.ConstantOp(dtype, 1.0 / 120.0, loc=loc).result
+    i32_one = arith.ConstantOp(i32, ir.IntegerAttr.get(i32, 1), loc=loc).result
+    i32_exp_bias = arith.ConstantOp(
+        i32, ir.IntegerAttr.get(i32, 127), loc=loc
+    ).result
+    i32_exp_shift = arith.ConstantOp(
+        i32, ir.IntegerAttr.get(i32, 23), loc=loc
+    ).result
     zero_vec = vector.SplatOp(v16, zero, loc=loc)
     step_1 = arith.ConstantOp(index, 1, loc=loc)
+
+    # Approximate exp(x) for x <= 0 with range reduction to keep softmax hot
+    # loops off libm while preserving good enough numerical accuracy.
+    def fast_exp_nonpositive(x):
+        x_gt_zero = arith.CmpFOp(
+            arith.CmpFPredicate.OGT, x, zero, loc=loc
+        ).result
+        x_clamped_hi = arith.SelectOp(x_gt_zero, zero, x, loc=loc).result
+        x_lt_min = arith.CmpFOp(
+            arith.CmpFPredicate.OLT, x_clamped_hi, exp_clamp_min, loc=loc
+        ).result
+        x_clamped = arith.SelectOp(
+            x_lt_min, exp_clamp_min, x_clamped_hi, loc=loc
+        ).result
+
+        scaled = arith.MulFOp(x_clamped, exp_inv_ln2, loc=loc).result
+        k_trunc = arith.FPToSIOp(i32, scaled, loc=loc).result
+        k_trunc_f = arith.SIToFPOp(dtype, k_trunc, loc=loc).result
+        needs_floor_fix = arith.CmpFOp(
+            arith.CmpFPredicate.OGT, k_trunc_f, scaled, loc=loc
+        ).result
+        k_minus_one = arith.SubIOp(k_trunc, i32_one, loc=loc).result
+        k = arith.SelectOp(
+            needs_floor_fix, k_minus_one, k_trunc, loc=loc
+        ).result
+
+        k_f = arith.SIToFPOp(dtype, k, loc=loc).result
+        reduced = arith.SubFOp(
+            x_clamped,
+            arith.MulFOp(k_f, exp_ln2, loc=loc).result,
+            loc=loc,
+        ).result
+
+        poly = exp_c5
+        poly = arith.AddFOp(
+            exp_c4, arith.MulFOp(reduced, poly, loc=loc).result, loc=loc
+        ).result
+        poly = arith.AddFOp(
+            exp_c3, arith.MulFOp(reduced, poly, loc=loc).result, loc=loc
+        ).result
+        poly = arith.AddFOp(
+            exp_c2, arith.MulFOp(reduced, poly, loc=loc).result, loc=loc
+        ).result
+        poly = arith.AddFOp(
+            exp_c1, arith.MulFOp(reduced, poly, loc=loc).result, loc=loc
+        ).result
+        poly = arith.AddFOp(
+            exp_c0, arith.MulFOp(reduced, poly, loc=loc).result, loc=loc
+        ).result
+
+        exponent_bits = arith.ShLIOp(
+            arith.AddIOp(k, i32_exp_bias, loc=loc).result,
+            i32_exp_shift,
+            loc=loc,
+        ).result
+        pow2 = arith.BitcastOp(dtype, exponent_bits, loc=loc).result
+        return arith.MulFOp(poly, pow2, loc=loc).result
 
     # === bufferization ===
     Q_memref = bufferization.ToBufferOp(
@@ -4322,19 +4398,19 @@ def flash_attention_for_cpu_prefill_op(
                 q_block_start = body_block.add_argument(
                     ir.IndexType.get(), ir.Location.unknown()
                 )
-                m_i_memref = memref.AllocOp(
+                m_i_memref = memref.AllocaOp(
                     memref.MemRefType.get([block_size_q_num], dtype),
                     [],
                     [],
                     loc=loc,
                 )
-                l_i_memref = memref.AllocOp(
+                l_i_memref = memref.AllocaOp(
                     memref.MemRefType.get([block_size_q_num], dtype),
                     [],
                     [],
                     loc=loc,
                 )
-                accum_memref = memref.AllocOp(
+                accum_memref = memref.AllocaOp(
                     memref.MemRefType.get(
                         [block_size_q_num, query_shape[3]], dtype
                     ),
@@ -4381,7 +4457,7 @@ def flash_attention_for_cpu_prefill_op(
                     k_block_start = body_block.add_argument(
                         ir.IndexType.get(), ir.Location.unknown()
                     )
-                    score_tile_memref = memref.AllocOp(
+                    score_tile_memref = memref.AllocaOp(
                         memref.MemRefType.get(
                             [block_size_q_num, block_size_kv_num], dtype
                         ),
@@ -4505,7 +4581,7 @@ def flash_attention_for_cpu_prefill_op(
                             scf.yield_([m_i_tile])
                         m_block = loop_kj.result
                         # initialize acc_block to zero
-                        acc_block_memref = memref.AllocOp(
+                        acc_block_memref = memref.AllocaOp(
                             memref.MemRefType.get([query_shape[3]], dtype),
                             [],
                             [],
@@ -4535,9 +4611,7 @@ def flash_attention_for_cpu_prefill_op(
                             score_tile_sub_m_block = arith.SubFOp(
                                 score_tile_masked, m_block, loc=loc
                             ).result
-                            p = math.ExpOp(
-                                score_tile_sub_m_block, loc=loc
-                            ).result
+                            p = fast_exp_nonpositive(score_tile_sub_m_block)
                             exp_score_tile_vec = vector.SplatOp(
                                 v16, p, loc=loc
                             ).result
@@ -4581,10 +4655,10 @@ def flash_attention_for_cpu_prefill_op(
                             m_i_iter_is_max, m_block, m_i_iter, loc=loc
                         ).result
                         sub_max = arith.SubFOp(m_i_iter, m_new, loc=loc).result
-                        alpha = math.ExpOp(sub_max, loc=loc).result
+                        alpha = fast_exp_nonpositive(sub_max)
                         alpha_vec = vector.SplatOp(v16, alpha, loc=loc).result
                         sub_block = arith.SubFOp(m_block, m_new, loc=loc).result
-                        beta = math.ExpOp(sub_block, loc=loc).result
+                        beta = fast_exp_nonpositive(sub_block)
                         beta_vec = vector.SplatOp(v16, beta, loc=loc).result
                         loop_k = scf.ForOp(c0.result, head_dim.result, vec_len)
                         with ir.InsertionPoint(loop_k.body):

@@ -317,7 +317,9 @@ if(IS_RVV_PLATFORM OR IS_RVV_CROSSCOMPILING)
   target_link_options(buddy-qwen3-0.6b-run PRIVATE ${RISCV_LINK_OPTS})
 endif()
 
-target_link_directories(buddy-qwen3-0.6b-run PRIVATE ${LLVM_LIBRARY_DIR})
+if(NOT IS_RVV_CROSSCOMPILING)
+  target_link_directories(buddy-qwen3-0.6b-run PRIVATE ${LLVM_LIBRARY_DIR})
+endif()
 
 if(IS_RVV_CROSSCOMPILING)
   set(BUDDY_QWEN3_0_6B_LIBS
@@ -340,9 +342,23 @@ endif()
 target_link_libraries(buddy-qwen3-0.6b-run ${BUDDY_QWEN3_0_6B_LIBS})
 
 if(IS_RVV_CROSSCOMPILING)
+  get_filename_component(RISCV_MLIR_C_RUNNER_UTILS_DIR ${RISCV_MLIR_C_RUNNER_UTILS} DIRECTORY)
+  get_filename_component(RISCV_OMP_SHARED_DIR ${RISCV_OMP_SHARED} DIRECTORY)
+  set(RISCV_MLIR_FLOAT16_UTILS ${RISCV_MLIR_C_RUNNER_UTILS_DIR}/libmlir_float16_utils.so.22.0git)
+  set(RISCV_MLIR_RUNNER_UTILS ${RISCV_MLIR_C_RUNNER_UTILS_DIR}/libmlir_runner_utils.so.22.0git)
+  if(NOT EXISTS ${RISCV_MLIR_FLOAT16_UTILS})
+    message(FATAL_ERROR
+      "BuddyQwen3 cross-compiling package requires ${RISCV_MLIR_FLOAT16_UTILS}.")
+  endif()
+  set_target_properties(buddy-qwen3-0.6b-run PROPERTIES
+    BUILD_RPATH "\$ORIGIN;${RISCV_MLIR_C_RUNNER_UTILS_DIR};${RISCV_OMP_SHARED_DIR}"
+    INSTALL_RPATH "\$ORIGIN"
+  )
+
   set(QWEN3_RVV_PKG_NAME "buddy-qwen3-0.6b-rvv-package")
   set(QWEN3_RVV_PKG_DIR ${CMAKE_CURRENT_BINARY_DIR}/${QWEN3_RVV_PKG_NAME})
   set(QWEN3_RVV_PKG_ARCHIVE ${CMAKE_CURRENT_BINARY_DIR}/${QWEN3_RVV_PKG_NAME}.tgz)
+  set(QWEN3_RVV_PKG_ARCHIVE_TMP ${QWEN3_RVV_PKG_ARCHIVE}.tmp)
 
   add_custom_target(buddy-qwen3-0.6b-rvv-package DEPENDS ${QWEN3_RVV_PKG_ARCHIVE})
   add_custom_command(
@@ -353,9 +369,13 @@ if(IS_RVV_CROSSCOMPILING)
       ${CMAKE_BINARY_DIR}/bin/buddy-qwen3-0.6b-run
       ${CMAKE_SOURCE_DIR}/examples/BuddyQwen3/vocab.txt
       ${RISCV_MLIR_C_RUNNER_UTILS}
+      ${RISCV_MLIR_FLOAT16_UTILS}
+      ${RISCV_MLIR_RUNNER_UTILS}
       ${RISCV_OMP_SHARED}
       ${QWEN3_RVV_PKG_DIR}/
-    COMMAND sh -c "tar -czf ${QWEN3_RVV_PKG_ARCHIVE} ${QWEN3_RVV_PKG_NAME}"
+    COMMAND ${CMAKE_COMMAND} -E rm -f ${QWEN3_RVV_PKG_ARCHIVE_TMP}
+    COMMAND sh -c "tar -czf ${QWEN3_RVV_PKG_ARCHIVE_TMP} ${QWEN3_RVV_PKG_NAME}"
+    COMMAND ${CMAKE_COMMAND} -E rename ${QWEN3_RVV_PKG_ARCHIVE_TMP} ${QWEN3_RVV_PKG_ARCHIVE}
     COMMAND ${CMAKE_COMMAND} -E remove_directory ${QWEN3_RVV_PKG_DIR}
     COMMENT "Creating RVV package: ${QWEN3_RVV_PKG_ARCHIVE}"
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
@@ -364,6 +384,8 @@ if(IS_RVV_CROSSCOMPILING)
       ${CMAKE_BINARY_DIR}/bin/buddy-qwen3-0.6b-run
       ${CMAKE_SOURCE_DIR}/examples/BuddyQwen3/vocab.txt
       ${RISCV_MLIR_C_RUNNER_UTILS}
+      ${RISCV_MLIR_FLOAT16_UTILS}
+      ${RISCV_MLIR_RUNNER_UTILS}
       ${RISCV_OMP_SHARED}
     USES_TERMINAL
     VERBATIM
