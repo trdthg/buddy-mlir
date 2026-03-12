@@ -30,8 +30,14 @@ endif()
 
 # Set platform-specific variables
 set(BUDDY_QWEN3_DEFAULT_OPENMP_THREADS 48)
+set(BUDDY_QWEN3_DEFAULT_BLIS_VECTOR_SIZE 32)
+set(BUDDY_QWEN3_DEFAULT_BATCH_TRANSPOSE_VECTOR_SIZE 32)
+set(BUDDY_QWEN3_DEFAULT_PREFILL_AFFINE_PARALLEL_MAX_NESTED "")
 if(IS_RVV_PLATFORM)
   set(BUDDY_QWEN3_DEFAULT_OPENMP_THREADS 32)
+  set(BUDDY_QWEN3_DEFAULT_BLIS_VECTOR_SIZE 8)
+  set(BUDDY_QWEN3_DEFAULT_BATCH_TRANSPOSE_VECTOR_SIZE 16)
+  set(BUDDY_QWEN3_DEFAULT_PREFILL_AFFINE_PARALLEL_MAX_NESTED 1)
   set(LLC_RISCV_ATTRS "-mattr=+m,+d,+v")
   set(RISCV_COMPILE_OPTS "-march=rv64gcv;-mabi=lp64d;-O3;-Wall")
   set(RISCV_LINK_OPTS "-march=rv64gcv;-mabi=lp64d")
@@ -42,6 +48,9 @@ endif()
 if(IS_RVV_CROSSCOMPILING)
   message(STATUS "Cross compiling BuddyQwen3 for RISC-V Vector (RVV)")
   set(BUDDY_QWEN3_DEFAULT_OPENMP_THREADS 8)
+  set(BUDDY_QWEN3_DEFAULT_BLIS_VECTOR_SIZE 8)
+  set(BUDDY_QWEN3_DEFAULT_BATCH_TRANSPOSE_VECTOR_SIZE 16)
+  set(BUDDY_QWEN3_DEFAULT_PREFILL_AFFINE_PARALLEL_MAX_NESTED 1)
   set(LLC_RISCV_ATTRS "-march=riscv64;-mattr=+m,+d,+v")
   set(RISCV_COMPILE_OPTS
     -march=rv64gcv
@@ -62,7 +71,20 @@ endif()
 
 set(BUDDY_QWEN3_OPENMP_THREADS "${BUDDY_QWEN3_DEFAULT_OPENMP_THREADS}" CACHE STRING
   "Number of OpenMP threads encoded into the BuddyQwen3 lowering pipeline")
+set(BUDDY_QWEN3_BLIS_VECTOR_SIZE "${BUDDY_QWEN3_DEFAULT_BLIS_VECTOR_SIZE}" CACHE STRING
+  "Vector width used by matmul-vectorization-blis for BuddyQwen3")
+set(BUDDY_QWEN3_BATCH_TRANSPOSE_VECTOR_SIZE "${BUDDY_QWEN3_DEFAULT_BATCH_TRANSPOSE_VECTOR_SIZE}" CACHE STRING
+  "Vector width used by batchmatmul-transpose-b-vectorization for BuddyQwen3")
+set(BUDDY_QWEN3_PREFILL_AFFINE_PARALLEL_MAX_NESTED
+  "${BUDDY_QWEN3_DEFAULT_PREFILL_AFFINE_PARALLEL_MAX_NESTED}" CACHE STRING
+  "Maximum nested affine.parallel depth for BuddyQwen3 prefill; empty keeps MLIR defaults")
 set(OPENMP_NUM_THREADS "num-threads=${BUDDY_QWEN3_OPENMP_THREADS}")
+if(BUDDY_QWEN3_PREFILL_AFFINE_PARALLEL_MAX_NESTED STREQUAL "")
+  set(BUDDY_QWEN3_PREFILL_AFFINE_PARALLELIZE_PASS -affine-parallelize)
+else()
+  set(BUDDY_QWEN3_PREFILL_AFFINE_PARALLELIZE_PASS
+    -affine-parallelize=max-nested=${BUDDY_QWEN3_PREFILL_AFFINE_PARALLEL_MAX_NESTED})
+endif()
 
 # Skip import commands on RVV platform
 if(NOT IS_RVV_PLATFORM)
@@ -97,10 +119,10 @@ add_custom_command(
             -cse
             -canonicalize
             -optimize-allocation-liveness
-            -matmul-vectorization-blis
+            -matmul-vectorization-blis=vector-size=${BUDDY_QWEN3_BLIS_VECTOR_SIZE}
             -batchmatmul-optimize
             -convert-linalg-to-affine-loops
-            -affine-parallelize
+            ${BUDDY_QWEN3_PREFILL_AFFINE_PARALLELIZE_PASS}
             -convert-vector-to-scf
             -lower-affine
             -convert-scf-to-openmp=${OPENMP_NUM_THREADS}
@@ -145,11 +167,11 @@ add_custom_command(
             -cse
             -canonicalize
             -optimize-allocation-liveness
-            -matmul-vectorization-blis
+            -matmul-vectorization-blis=vector-size=${BUDDY_QWEN3_BLIS_VECTOR_SIZE}
             -batchmatmul-optimize
-            -batchmatmul-transpose-b-vectorization
+            -batchmatmul-transpose-b-vectorization=vector-size=${BUDDY_QWEN3_BATCH_TRANSPOSE_VECTOR_SIZE}
             -convert-linalg-to-affine-loops
-            -affine-parallelize
+            ${BUDDY_QWEN3_PREFILL_AFFINE_PARALLELIZE_PASS}
             -convert-vector-to-scf
             -lower-affine
             -convert-scf-to-openmp=${OPENMP_NUM_THREADS}
@@ -194,7 +216,7 @@ add_custom_command(
             -cse
             -canonicalize
             -optimize-allocation-liveness
-            -matmul-vectorization-blis
+            -matmul-vectorization-blis=vector-size=${BUDDY_QWEN3_BLIS_VECTOR_SIZE}
             -batchmatmul-optimize
             -convert-linalg-to-affine-loops
             -affine-parallelize

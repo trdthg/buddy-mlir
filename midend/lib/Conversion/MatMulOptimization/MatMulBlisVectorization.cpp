@@ -42,8 +42,10 @@ namespace {
 
 class MatMulVectorizationBLISPattern : public ConversionPattern {
 public:
-  explicit MatMulVectorizationBLISPattern(MLIRContext *context)
-      : ConversionPattern(linalg::MatmulOp::getOperationName(), 1, context) {}
+  explicit MatMulVectorizationBLISPattern(MLIRContext *context,
+                                          int64_t vectorSizeParam)
+      : ConversionPattern(linalg::MatmulOp::getOperationName(), 1, context),
+        vectorSize(vectorSizeParam) {}
 
   LogicalResult
   matchAndRewrite(Operation *op, ArrayRef<Value> /*operands*/,
@@ -78,7 +80,7 @@ public:
     const Value mr = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIndexAttr(8)); // mr = 8
     const Value nr = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getIndexAttr(32)); // nr = 32
+        loc, rewriter.getIndexAttr(vectorSize));
 
     // Get input A, B, C
     Value A = op->getOperand(0);
@@ -96,9 +98,9 @@ public:
     ShapedType CTy = cast<ShapedType>(C.getType());
     Type accEleTy = CTy.getElementType();
     bool isInteger = isa<IntegerType>(eleTy);
-    VectorType vectorTy = VectorType::get({32}, eleTy);
+    VectorType vectorTy = VectorType::get({vectorSize}, eleTy);
     VectorType accVecTy =
-        isInteger ? VectorType::get({32}, accEleTy) : vectorTy;
+        isInteger ? VectorType::get({vectorSize}, accEleTy) : vectorTy;
 
     // BLIS 5-loop structure
     // Loop 1: jc - column blocking
@@ -596,6 +598,9 @@ public:
     rewriter.eraseOp(op);
     return success();
   }
+
+private:
+  int64_t vectorSize;
 };
 } // end anonymous namespace
 
@@ -614,6 +619,11 @@ public:
   }
   MatMulVectorizationBLISPass() = default;
   MatMulVectorizationBLISPass(const MatMulVectorizationBLISPass &) {}
+
+  Option<int64_t> vectorSize{
+      *this, "vector-size",
+      llvm::cl::desc("Specify the vector width used by the BLIS micro-kernel."),
+      llvm::cl::init(32)};
 
   void runOnOperation() override;
 
@@ -637,7 +647,7 @@ void MatMulVectorizationBLISPass::runOnOperation() {
   target.addLegalOp<linalg::FillOp>();
 
   RewritePatternSet patterns(context);
-  patterns.add<MatMulVectorizationBLISPattern>(context);
+  patterns.add<MatMulVectorizationBLISPattern>(context, vectorSize);
 
   if (failed(applyPartialConversion(module, target, std::move(patterns))))
     signalPassFailure();

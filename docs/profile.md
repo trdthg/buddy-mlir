@@ -8,7 +8,7 @@
 cd ~/repo/cross-compile/buddy-qwen3-0.6b-rvv-package
 
 export OUT=perf_$(date +%Y%m%d_%H%M%S)
-export WINDOW=10
+export WINDOW=15
 mkdir -p "$OUT"
 
 export PID=$(ps -eo pid=,args= | awk '/[b]uddy-qwen3-0\.6b-run/ {print $1; exit}')
