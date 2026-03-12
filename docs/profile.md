@@ -1,10 +1,3 @@
-# Qwen3 K1 Perf
-
-程序先由你自己启动。
-
-进入 `prefill` 阶段后，在另一个终端里直接复制下面这一整段。它会用 `ps` 找 `buddy-qwen3-0.6b-run` 的 PID，顺序跑完 `perf stat`、`perf record`、`perf report`，结果统一输出到一个时间戳目录里。
-
-```bash
 cd ~/repo/cross-compile/buddy-qwen3-0.6b-rvv-package
 
 export OUT=perf_$(date +%Y%m%d_%H%M%S)
@@ -41,12 +34,3 @@ grep -E 'subgraph0_prefill|subgraph0_decode|expf|malloc|free|__kmp' "$OUT/04_hot
 echo
 echo "done: $OUT"
 ls -lh "$OUT"
-```
-
-结果重点看这几个文件：
-
-- `01_overview.txt`
-- `02_mem_tlb.txt`
-- `03_lsu_vpu.txt`
-- `04_hotspots_all.txt`
-- `05_hotspots_focus.txt`
