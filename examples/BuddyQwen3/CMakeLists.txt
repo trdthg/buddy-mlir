@@ -31,6 +31,7 @@ endif()
 # Set platform-specific variables
 set(BUDDY_QWEN3_DEFAULT_OPENMP_THREADS 48)
 set(BUDDY_QWEN3_DEFAULT_BLIS_VECTOR_SIZE 32)
+set(BUDDY_QWEN3_DEFAULT_BLIS_PARALLEL_OUTER_LOOP ON)
 set(BUDDY_QWEN3_DEFAULT_BATCH_TRANSPOSE_VECTOR_SIZE 32)
 set(BUDDY_QWEN3_DEFAULT_PREFILL_AFFINE_PARALLEL_MAX_NESTED "")
 if(IS_RVV_PLATFORM)
@@ -73,11 +74,20 @@ set(BUDDY_QWEN3_OPENMP_THREADS "${BUDDY_QWEN3_DEFAULT_OPENMP_THREADS}" CACHE STR
   "Number of OpenMP threads encoded into the BuddyQwen3 lowering pipeline")
 set(BUDDY_QWEN3_BLIS_VECTOR_SIZE "${BUDDY_QWEN3_DEFAULT_BLIS_VECTOR_SIZE}" CACHE STRING
   "Vector width used by matmul-vectorization-blis for BuddyQwen3")
+set(BUDDY_QWEN3_BLIS_PARALLEL_OUTER_LOOP "${BUDDY_QWEN3_DEFAULT_BLIS_PARALLEL_OUTER_LOOP}" CACHE BOOL
+  "Whether BuddyQwen3 should parallelize the outer jc loop in matmul-vectorization-blis")
 set(BUDDY_QWEN3_BATCH_TRANSPOSE_VECTOR_SIZE "${BUDDY_QWEN3_DEFAULT_BATCH_TRANSPOSE_VECTOR_SIZE}" CACHE STRING
   "Vector width used by batchmatmul-transpose-b-vectorization for BuddyQwen3")
 set(BUDDY_QWEN3_PREFILL_AFFINE_PARALLEL_MAX_NESTED
   "${BUDDY_QWEN3_DEFAULT_PREFILL_AFFINE_PARALLEL_MAX_NESTED}" CACHE STRING
   "Maximum nested affine.parallel depth for BuddyQwen3 prefill; empty keeps MLIR defaults")
+if(BUDDY_QWEN3_BLIS_PARALLEL_OUTER_LOOP)
+  set(BUDDY_QWEN3_BLIS_PARALLEL_OUTER_LOOP_OPT true)
+else()
+  set(BUDDY_QWEN3_BLIS_PARALLEL_OUTER_LOOP_OPT false)
+endif()
+set(BUDDY_QWEN3_BLIS_PASS_OPTS
+  "vector-size=${BUDDY_QWEN3_BLIS_VECTOR_SIZE} parallel-outer-loop=${BUDDY_QWEN3_BLIS_PARALLEL_OUTER_LOOP_OPT}")
 set(OPENMP_NUM_THREADS "num-threads=${BUDDY_QWEN3_OPENMP_THREADS}")
 if(BUDDY_QWEN3_PREFILL_AFFINE_PARALLEL_MAX_NESTED STREQUAL "")
   set(BUDDY_QWEN3_PREFILL_AFFINE_PARALLELIZE_PASS -affine-parallelize)
@@ -119,7 +129,7 @@ add_custom_command(
             -cse
             -canonicalize
             -optimize-allocation-liveness
-            -matmul-vectorization-blis=vector-size=${BUDDY_QWEN3_BLIS_VECTOR_SIZE}
+            -matmul-vectorization-blis=${BUDDY_QWEN3_BLIS_PASS_OPTS}
             -batchmatmul-optimize
             -convert-linalg-to-affine-loops
             ${BUDDY_QWEN3_PREFILL_AFFINE_PARALLELIZE_PASS}
@@ -167,7 +177,7 @@ add_custom_command(
             -cse
             -canonicalize
             -optimize-allocation-liveness
-            -matmul-vectorization-blis=vector-size=${BUDDY_QWEN3_BLIS_VECTOR_SIZE}
+            -matmul-vectorization-blis=${BUDDY_QWEN3_BLIS_PASS_OPTS}
             -batchmatmul-optimize
             -batchmatmul-transpose-b-vectorization=vector-size=${BUDDY_QWEN3_BATCH_TRANSPOSE_VECTOR_SIZE}
             -convert-linalg-to-affine-loops
@@ -216,7 +226,7 @@ add_custom_command(
             -cse
             -canonicalize
             -optimize-allocation-liveness
-            -matmul-vectorization-blis=vector-size=${BUDDY_QWEN3_BLIS_VECTOR_SIZE}
+            -matmul-vectorization-blis=${BUDDY_QWEN3_BLIS_PASS_OPTS}
             -batchmatmul-optimize
             -convert-linalg-to-affine-loops
             -affine-parallelize

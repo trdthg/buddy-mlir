@@ -43,9 +43,11 @@ namespace {
 class MatMulVectorizationBLISPattern : public ConversionPattern {
 public:
   explicit MatMulVectorizationBLISPattern(MLIRContext *context,
-                                          int64_t vectorSizeParam)
+                                          int64_t vectorSizeParam,
+                                          bool parallelOuterLoopParam)
       : ConversionPattern(linalg::MatmulOp::getOperationName(), 1, context),
-        vectorSize(vectorSizeParam) {}
+        vectorSize(vectorSizeParam),
+        parallelOuterLoop(parallelOuterLoopParam) {}
 
   LogicalResult
   matchAndRewrite(Operation *op, ArrayRef<Value> /*operands*/,
@@ -103,10 +105,7 @@ public:
         isInteger ? VectorType::get({vectorSize}, accEleTy) : vectorTy;
 
     // BLIS 5-loop structure
-    // Loop 1: jc - column blocking
-    rewriter.create<scf::ParallelOp>(
-        loc, c0, n, nc, [&](OpBuilder &builder, Location loc, ValueRange ivs) {
-          Value jc = ivs[0];
+    auto buildJcBody = [&](OpBuilder &builder, Location loc, Value jc) {
           // Compute actual nc for this block
           auto jcEnd = builder.create<arith::AddIOp>(loc, jc, nc);
           auto jcBound = builder.create<arith::CmpIOp>(
@@ -593,7 +592,23 @@ public:
 
                 builder.create<scf::YieldOp>(loc);
               });
-        });
+    };
+
+    // Loop 1: jc - column blocking
+    if (parallelOuterLoop) {
+      rewriter.create<scf::ParallelOp>(
+          loc, c0, n, nc,
+          [&](OpBuilder &builder, Location loc, ValueRange ivs) {
+            buildJcBody(builder, loc, ivs[0]);
+          });
+    } else {
+      rewriter.create<scf::ForOp>(
+          loc, c0, n, nc, ValueRange{},
+          [&](OpBuilder &builder, Location loc, Value jc, ValueRange) {
+            buildJcBody(builder, loc, jc);
+            builder.create<scf::YieldOp>(loc);
+          });
+    }
 
     rewriter.eraseOp(op);
     return success();
@@ -601,6 +616,7 @@ public:
 
 private:
   int64_t vectorSize;
+  bool parallelOuterLoop;
 };
 } // end anonymous namespace
 
@@ -625,6 +641,12 @@ public:
       llvm::cl::desc("Specify the vector width used by the BLIS micro-kernel."),
       llvm::cl::init(32)};
 
+  Option<bool> parallelOuterLoop{
+      *this, "parallel-outer-loop",
+      llvm::cl::desc(
+          "Parallelize the outer jc loop in addition to the inner ic loop."),
+      llvm::cl::init(true)};
+
   void runOnOperation() override;
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -647,7 +669,8 @@ void MatMulVectorizationBLISPass::runOnOperation() {
   target.addLegalOp<linalg::FillOp>();
 
   RewritePatternSet patterns(context);
-  patterns.add<MatMulVectorizationBLISPattern>(context, vectorSize);
+  patterns.add<MatMulVectorizationBLISPattern>(context, vectorSize,
+                                               parallelOuterLoop);
 
   if (failed(applyPartialConversion(module, target, std::move(patterns))))
     signalPassFailure();
