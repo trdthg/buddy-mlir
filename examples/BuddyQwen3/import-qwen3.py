@@ -39,6 +39,8 @@ from buddy.compiler.graph.transform import (
     apply_classic_fusion,
     eliminate_transpose,
     eliminate_matmul_transpose_reshape,
+    rotate_half_fusion,
+    rotary_embedding_fusion,
     flash_attention_prefill,
     gqa_attention_fusion,
 )
@@ -146,11 +148,15 @@ graphs_decode[0].perform(
     [eliminate_transpose, eliminate_matmul_transpose_reshape]
 )
 pattern_list_prefill = [
+    rotate_half_fusion,
+    rotary_embedding_fusion,
     simply_fuse,
     apply_classic_fusion,
     flash_attention_prefill,
 ]
 pattern_list_decode = [
+    rotate_half_fusion,
+    rotary_embedding_fusion,
     simply_fuse,
     apply_classic_fusion,
     gqa_attention_fusion,

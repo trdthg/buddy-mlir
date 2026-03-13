@@ -1867,6 +1867,218 @@ def neg_op(
     return op
 
 
+def rotate_half_op(
+    node: RotateHalfOp,
+    symbol_table: Dict[Tuple[str, int], ir.Operation],
+):
+    """
+    Lower a fused RoPE rotate_half pattern without slice/cat temporaries.
+    rotate_half(x) = cat([-x[..., half:], x[..., :half]], dim=-1)
+    """
+    input1 = symbol_table.get((str(node.args[0]), 0))
+    if input1 is None:
+        return
+
+    input_type = ir.RankedTensorType(input1.type)
+    input_shape = list(input_type.shape)
+    rank = len(input_shape)
+    dim = int(node.args[1]) if len(node.args) > 1 else -1
+    if dim < 0:
+        dim += rank
+    if dim < 0 or dim >= rank:
+        raise NotImplementedError("rotate_half dim out of range")
+    if input_shape[dim] <= 0 or input_shape[dim] % 2 != 0:
+        raise NotImplementedError("rotate_half requires a static even split")
+    if not ir.FloatType.isinstance(input_type.element_type):
+        raise NotImplementedError("rotate_half currently supports float tensors")
+
+    half_extent = input_shape[dim] // 2
+    output_shape = list(node.tensor_meta["shape"])
+    output = tensor.EmptyOp(output_shape, input_type.element_type)
+    output_type = ir.RankedTensorType.get(
+        output_shape, input_type.element_type
+    )
+
+    generic_map = ir.AffineMap.get_permutation([i for i in range(rank)])
+    out_map_attr = ir.AffineMapAttr.get(generic_map)
+    iterator_attr = ir.ArrayAttr.get(
+        [ir.Attribute.parse("#linalg.iterator_type<parallel>")] * rank
+    )
+
+    op = linalg.GenericOp(
+        [output_type],
+        [],
+        [output],
+        ir.ArrayAttr.get([out_map_attr]),
+        iterator_attr,
+    )
+
+    block = ir.Block.create_at_start(
+        op.region, [ir.RankedTensorType(output.result.type).element_type]
+    )
+
+    half_const = arith.ConstantOp(ir.IndexType.get(), half_extent)
+    block.append(half_const)
+
+    out_indices = []
+    for d in range(rank):
+        idx = linalg.IndexOp(ir._i64Attr(d, None))
+        block.append(idx)
+        out_indices.append(idx.result)
+
+    is_lower_half = arith.CmpIOp(
+        arith.CmpIPredicate.slt, out_indices[dim], half_const.result
+    )
+    block.append(is_lower_half)
+
+    upper_indices = list(out_indices)
+    upper_src = arith.AddIOp(out_indices[dim], half_const.result)
+    block.append(upper_src)
+    upper_indices[dim] = upper_src.result
+    upper_value = tensor.ExtractOp(input1, upper_indices)
+    block.append(upper_value)
+    neg_upper_value = arith.NegFOp(upper_value.result)
+    block.append(neg_upper_value)
+
+    lower_indices = list(out_indices)
+    lower_src = arith.SubIOp(out_indices[dim], half_const.result)
+    block.append(lower_src)
+    lower_indices[dim] = lower_src.result
+    lower_value = tensor.ExtractOp(input1, lower_indices)
+    block.append(lower_value)
+
+    result = arith.SelectOp(
+        is_lower_half.result, neg_upper_value.result, lower_value.result
+    )
+    block.append(result)
+    block.append(linalg.YieldOp([result.result]))
+
+    return op
+
+
+def rotary_embedding_op(
+    node: RotaryEmbeddingOp,
+    symbol_table: Dict[Tuple[str, int], ir.Operation],
+):
+    """
+    Lower q*cos + rotate_half(q)*sin into a single elementwise kernel.
+    """
+    base = symbol_table.get((str(node.args[0]), 0))
+    cos_input = symbol_table.get((str(node.args[1]), 0))
+    sin_input = symbol_table.get((str(node.args[2]), 0))
+    if base is None or cos_input is None or sin_input is None:
+        return
+
+    base_type = ir.RankedTensorType(base.type)
+    base_shape = list(base_type.shape)
+    rank = len(base_shape)
+    dim = int(node.args[3]) if len(node.args) > 3 else -1
+    if dim < 0:
+        dim += rank
+    if dim < 0 or dim >= rank:
+        raise NotImplementedError("rotary_embedding dim out of range")
+    if base_shape[dim] <= 0 or base_shape[dim] % 2 != 0:
+        raise NotImplementedError(
+            "rotary_embedding requires a static even split"
+        )
+    if not ir.FloatType.isinstance(base_type.element_type):
+        raise NotImplementedError(
+            "rotary_embedding currently supports float tensors"
+        )
+
+    cos_shape = list(ir.RankedTensorType(cos_input.type).shape)
+    sin_shape = list(ir.RankedTensorType(sin_input.type).shape)
+    output_shape = list(node.tensor_meta["shape"])
+    output = tensor.EmptyOp(output_shape, base_type.element_type)
+    output_type = ir.RankedTensorType.get(output_shape, base_type.element_type)
+    half_extent = base_shape[dim] // 2
+
+    generic_map = ir.AffineMap.get_permutation([i for i in range(rank)])
+    out_map_attr = ir.AffineMapAttr.get(generic_map)
+    iterator_attr = ir.ArrayAttr.get(
+        [ir.Attribute.parse("#linalg.iterator_type<parallel>")] * rank
+    )
+
+    op = linalg.GenericOp(
+        [output_type],
+        [],
+        [output],
+        ir.ArrayAttr.get([out_map_attr]),
+        iterator_attr,
+    )
+
+    block = ir.Block.create_at_start(
+        op.region, [ir.RankedTensorType(output.result.type).element_type]
+    )
+
+    zero_idx = arith.ConstantOp(ir.IndexType.get(), 0)
+    half_const = arith.ConstantOp(ir.IndexType.get(), half_extent)
+    block.append(zero_idx)
+    block.append(half_const)
+
+    out_indices = []
+    for d in range(rank):
+        idx = linalg.IndexOp(ir._i64Attr(d, None))
+        block.append(idx)
+        out_indices.append(idx.result)
+
+    def _broadcast_indices(shape):
+        indices = []
+        for axis, size in enumerate(shape):
+            if size == 1:
+                indices.append(zero_idx.result)
+            else:
+                indices.append(out_indices[axis])
+        return indices
+
+    base_indices = _broadcast_indices(base_shape)
+    cos_indices = _broadcast_indices(cos_shape)
+    sin_indices = _broadcast_indices(sin_shape)
+
+    base_value = tensor.ExtractOp(base, base_indices)
+    block.append(base_value)
+    cos_value = tensor.ExtractOp(cos_input, cos_indices)
+    block.append(cos_value)
+    sin_value = tensor.ExtractOp(sin_input, sin_indices)
+    block.append(sin_value)
+
+    is_lower_half = arith.CmpIOp(
+        arith.CmpIPredicate.slt, out_indices[dim], half_const.result
+    )
+    block.append(is_lower_half)
+
+    upper_indices = list(base_indices)
+    upper_src = arith.AddIOp(out_indices[dim], half_const.result)
+    block.append(upper_src)
+    upper_indices[dim] = upper_src.result
+    upper_value = tensor.ExtractOp(base, upper_indices)
+    block.append(upper_value)
+    neg_upper_value = arith.NegFOp(upper_value.result)
+    block.append(neg_upper_value)
+
+    lower_indices = list(base_indices)
+    lower_src = arith.SubIOp(out_indices[dim], half_const.result)
+    block.append(lower_src)
+    lower_indices[dim] = lower_src.result
+    lower_value = tensor.ExtractOp(base, lower_indices)
+    block.append(lower_value)
+
+    rotated_value = arith.SelectOp(
+        is_lower_half.result, neg_upper_value.result, lower_value.result
+    )
+    block.append(rotated_value)
+
+    mul_base = arith.MulFOp(base_value.result, cos_value.result)
+    block.append(mul_base)
+    mul_rot = arith.MulFOp(rotated_value.result, sin_value.result)
+    block.append(mul_rot)
+    result = arith.AddFOp(mul_base.result, mul_rot.result)
+    block.append(result)
+    block.append(linalg.YieldOp([result.result]))
+
+    return op
+
+
 def cat_op(
     node: CatOp,
     symbol_table: Dict[Tuple[str, int], ir.Operation],
@@ -12902,6 +13114,8 @@ ops_registry = {
     "TransposeOp": transpose_op,
     "IndexOp": index_op,
     "NegOp": neg_op,
+    "RotateHalfOp": rotate_half_op,
+    "RotaryEmbeddingOp": rotary_embedding_op,
     "CatOp": cat_op,
     "SqueezeOp": squeeze_op,
     "SqueezeDimOp": squeeze_op,

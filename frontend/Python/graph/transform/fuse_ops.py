@@ -27,6 +27,8 @@ classicfuse_register = {
     "transpose_matmul_fusion": TransposeMatmulFusedOp,
     "flash_attention_prefill_fusion": FlashAttentionForCpuPrefillOp,
     "gqa_attention_fusion": GQAAttentionFusedOp,
+    "rotate_half_fusion": RotateHalfOp,
+    "rotary_embedding_fusion": RotaryEmbeddingOp,
 }
 
 # TODO: classify op type for op fusion
@@ -138,6 +140,239 @@ def simply_fuse(graph: Graph):
     graph.op_groups = {}
     graph.op_groups["subgraph0"] = new_op_group
     graph.group_map_device = {"subgraph0": device}
+
+
+def rotate_half_fusion(graph: Graph):
+    """
+    Fuse slice + negate + cat patterns that implement RoPE rotate_half.
+    """
+    for op in list(graph.body):
+        match = _match_rotate_half_cat(graph, op)
+        if match is None:
+            continue
+        replace_rotate_half_with_fused_op(graph, op, *match)
+
+
+def rotary_embedding_fusion(graph: Graph):
+    """
+    Fuse q*cos + rotate_half(q)*sin into one RotaryEmbeddingOp.
+    """
+    for op in list(graph.body):
+        match = _match_rotary_embedding_add(graph, op)
+        if match is None:
+            continue
+        replace_rotary_embedding_with_fused_op(graph, op, *match)
+
+
+def _match_rotate_half_cat(graph: Graph, node: Op):
+    if not isinstance(node, CatOp):
+        return None
+
+    inputs = node.args[0]
+    if len(inputs) != 2:
+        return None
+
+    output_shape = list(node.tensor_meta["shape"])
+    rank = len(output_shape)
+    dim = int(node.args[1]) if len(node.args) > 1 else 0
+    if dim < 0:
+        dim += rank
+    if dim != rank - 1:
+        return None
+
+    neg_node = graph.node_table.get(str(inputs[0]), None)
+    lower_slice = graph.node_table.get(str(inputs[1]), None)
+    if not isinstance(neg_node, NegOp) or not isinstance(lower_slice, SliceOp):
+        return None
+    if len(neg_node._parents) != 1 or len(lower_slice._parents) != 1:
+        return None
+
+    upper_slice = graph.node_table.get(neg_node._parents[0], None)
+    if not isinstance(upper_slice, SliceOp):
+        return None
+    if len(upper_slice._parents) != 1:
+        return None
+    if upper_slice._parents[0] != lower_slice._parents[0]:
+        return None
+
+    base = graph.node_table.get(lower_slice._parents[0], None)
+    if base is None:
+        return None
+
+    def _slice_signature(slice_node: SliceOp):
+        if len(slice_node.args) < 4:
+            return None
+        slice_dim = int(slice_node.args[1])
+        if slice_dim < 0:
+            slice_dim += rank
+        start = int(slice_node.args[2])
+        end = int(slice_node.args[3])
+        base_shape = list(base.tensor_meta["shape"])
+        if end > base_shape[slice_dim]:
+            end = base_shape[slice_dim]
+        step = int(slice_node.args[4]) if len(slice_node.args) > 4 else 1
+        return slice_dim, start, end, step
+
+    lower_sig = _slice_signature(lower_slice)
+    upper_sig = _slice_signature(upper_slice)
+    if lower_sig is None or upper_sig is None:
+        return None
+
+    slice_dim, lower_start, lower_end, lower_step = lower_sig
+    upper_dim, upper_start, upper_end, upper_step = upper_sig
+    if slice_dim != dim or upper_dim != dim:
+        return None
+    if lower_step != 1 or upper_step != 1:
+        return None
+
+    full_extent = output_shape[dim]
+    if full_extent <= 0 or full_extent % 2 != 0:
+        return None
+    half_extent = full_extent // 2
+    if (lower_start, lower_end) != (0, half_extent):
+        return None
+    if (upper_start, upper_end) != (half_extent, full_extent):
+        return None
+
+    lower_shape = list(lower_slice.tensor_meta["shape"])
+    upper_shape = list(upper_slice.tensor_meta["shape"])
+    if lower_shape != upper_shape:
+        return None
+    if lower_shape[dim] != half_extent:
+        return None
+
+    return base, lower_slice, upper_slice, neg_node, dim
+
+
+def replace_rotate_half_with_fused_op(
+    graph: Graph,
+    cat_node: CatOp,
+    base: Op,
+    lower_slice: SliceOp,
+    upper_slice: SliceOp,
+    neg_node: NegOp,
+    dim: int,
+):
+    fused_op = classicfuse_register.get("rotate_half_fusion")()
+    fused_op.name = "RotateHalf_" + cat_node.name
+    graph.displace_node(cat_node, fused_op)
+    fused_op._op_type = OpType.ElementwiseType
+
+    for old_parent_name in list(fused_op._parents):
+        old_parent = graph.node_table.get(old_parent_name, None)
+        if old_parent is None:
+            continue
+        if fused_op.name in old_parent._children:
+            old_parent._children.remove(fused_op.name)
+
+    fused_op.args.clear()
+    fused_op._parents.clear()
+    fused_op.args.extend([base.name, dim])
+    fused_op._parents.append(base.name)
+    base.add_children(fused_op.name)
+
+    if graph.check_delete_node(lower_slice):
+        graph.delete_node(lower_slice, [base])
+    if graph.check_delete_node(neg_node):
+        graph.delete_node(neg_node, [upper_slice])
+    if graph.check_delete_node(upper_slice):
+        graph.delete_node(upper_slice, [base])
+
+
+def _match_rotary_embedding_add(graph: Graph, node: Op):
+    if not isinstance(node, AddOp):
+        return None
+    if len(node._parents) != 2:
+        return None
+
+    lhs = graph.node_table.get(node._parents[0], None)
+    rhs = graph.node_table.get(node._parents[1], None)
+    if not isinstance(lhs, MulOp) or not isinstance(rhs, MulOp):
+        return None
+
+    def _classify_mul(mul_node: MulOp):
+        if len(mul_node._parents) != 2:
+            return None
+        parent0 = graph.node_table.get(mul_node._parents[0], None)
+        parent1 = graph.node_table.get(mul_node._parents[1], None)
+        if isinstance(parent0, RotateHalfOp):
+            return ("rot", parent0, parent1)
+        if isinstance(parent1, RotateHalfOp):
+            return ("rot", parent1, parent0)
+        return ("plain", parent0, parent1)
+
+    lhs_kind, lhs_data, lhs_other = _classify_mul(lhs)
+    rhs_kind, rhs_data, rhs_other = _classify_mul(rhs)
+    if {lhs_kind, rhs_kind} != {"plain", "rot"}:
+        return None
+
+    plain_mul = lhs if lhs_kind == "plain" else rhs
+    plain_data = lhs_data if lhs_kind == "plain" else rhs_data
+    plain_other = lhs_other if lhs_kind == "plain" else rhs_other
+    rot_mul = lhs if lhs_kind == "rot" else rhs
+    rotate_half = lhs_data if lhs_kind == "rot" else rhs_data
+    sin_input = lhs_other if lhs_kind == "rot" else rhs_other
+
+    if not isinstance(rotate_half, RotateHalfOp):
+        return None
+    base = graph.node_table.get(rotate_half._parents[0], None)
+    if base is None:
+        return None
+
+    if plain_data == base:
+        cos_input = plain_other
+    elif plain_other == base:
+        cos_input = plain_data
+    else:
+        return None
+
+    if cos_input is None or sin_input is None:
+        return None
+
+    dim = int(rotate_half.args[1]) if len(rotate_half.args) > 1 else -1
+    return base, cos_input, sin_input, rotate_half, plain_mul, rot_mul, dim
+
+
+def replace_rotary_embedding_with_fused_op(
+    graph: Graph,
+    add_node: AddOp,
+    base: Op,
+    cos_input: Op,
+    sin_input: Op,
+    rotate_half: RotateHalfOp,
+    plain_mul: MulOp,
+    rot_mul: MulOp,
+    dim: int,
+):
+    fused_op = classicfuse_register.get("rotary_embedding_fusion")()
+    fused_op.name = "RotaryEmbedding_" + add_node.name
+    graph.displace_node(add_node, fused_op)
+    fused_op._op_type = OpType.ElementwiseType
+
+    for old_parent_name in list(fused_op._parents):
+        old_parent = graph.node_table.get(old_parent_name, None)
+        if old_parent is None:
+            continue
+        if fused_op.name in old_parent._children:
+            old_parent._children.remove(fused_op.name)
+
+    fused_op.args.clear()
+    fused_op._parents.clear()
+    fused_op.args.extend([base.name, cos_input.name, sin_input.name, dim])
+    fused_op._parents.extend([base.name, cos_input.name, sin_input.name])
+    base.add_children(fused_op.name)
+    cos_input.add_children(fused_op.name)
+    sin_input.add_children(fused_op.name)
+
+    if graph.check_delete_node(plain_mul):
+        graph.delete_node(
+            plain_mul,
+            [graph.node_table[p] for p in plain_mul._parents],
+        )
+    if graph.check_delete_node(rot_mul):
+        graph.delete_node(rot_mul, [graph.node_table[p] for p in rot_mul._parents])
+    if graph.check_delete_node(rotate_half):
+        graph.delete_node(rotate_half, [base])
 
 
 def flash_attention_prefill(graph: Graph):

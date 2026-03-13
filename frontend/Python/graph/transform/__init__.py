@@ -21,6 +21,8 @@
 from .fuse_ops import (
     simply_fuse,
     apply_classic_fusion,
+    rotate_half_fusion,
+    rotary_embedding_fusion,
     flash_attention_prefill,
     gqa_attention_fusion,
 )

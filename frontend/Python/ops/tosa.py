@@ -2975,13 +2975,13 @@ def permute_op(node: PermuteOp, symbol_table):
     """
     input_tensor = symbol_table.get((str(node.args[0]), 0))
     perm = node.args[1]
-    perms_attr = _create_permutation_attr(perm)
     result_element_type = ir.RankedTensorType(input_tensor.type).element_type
     init_shape = ir.RankedTensorType(input_tensor.type).shape
     new_shape = []
     for perm_item in perm:
         new_shape.append(init_shape[perm_item])
 
+    perms_attr = _create_permutation_attr(perm)
     permute_result_type = ir.RankedTensorType.get(
         new_shape, result_element_type
     )
@@ -3211,8 +3211,8 @@ def transpose_op(node: TransposeOp, symbol_table):
     perm_list[dim1] = perm_list[dim2]
     perm_list[dim2] = temp
     output_shape = list(node.tensor_meta["shape"])
-    perms_attr = _create_permutation_attr(perm_list)
     result_element_type = ir.RankedTensorType(input1.type).element_type
+    perms_attr = _create_permutation_attr(perm_list)
     permute_result_type = ir.RankedTensorType.get(
         output_shape, result_element_type
     )
