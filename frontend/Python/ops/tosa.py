@@ -18,7 +18,7 @@
 #
 # ===---------------------------------------------------------------------------
 
-import array, copy
+import array, copy, os
 from typing import Dict, List, Sequence, Tuple, Union
 import numpy
 import sys
@@ -4259,6 +4259,20 @@ def flash_attention_for_cpu_prefill_op(
     zero_vec = vector.SplatOp(v16, zero, loc=loc)
     step_1 = arith.ConstantOp(index, 1, loc=loc)
 
+    def get_positive_int_env(name: str, default: int) -> int:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"{name} must be an integer, got {value!r}"
+            ) from exc
+        if parsed <= 0:
+            raise ValueError(f"{name} must be positive, got {parsed}")
+        return parsed
+
     # Approximate exp(x) for x <= 0 with range reduction to keep softmax hot
     # loops off libm while preserving good enough numerical accuracy.
     def fast_exp_nonpositive(x):
@@ -4342,8 +4356,12 @@ def flash_attention_for_cpu_prefill_op(
     head_dim = arith.ConstantOp(index, query_shape[3], loc=loc)
     k_seq_len = arith.ConstantOp(index, key_shape[2], loc=loc)
 
-    block_size_q_num = 16
-    block_size_kv_num = 64
+    block_size_q_num = get_positive_int_env(
+        "BUDDY_QWEN3_PREFILL_BLOCK_SIZE_Q", 16
+    )
+    block_size_kv_num = get_positive_int_env(
+        "BUDDY_QWEN3_PREFILL_BLOCK_SIZE_KV", 64
+    )
     block_size_q = arith.ConstantOp(index, block_size_q_num, loc=loc)
     block_size_kv = arith.ConstantOp(index, block_size_kv_num, loc=loc)
 

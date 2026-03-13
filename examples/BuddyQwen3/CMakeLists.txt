@@ -33,6 +33,8 @@ set(BUDDY_QWEN3_DEFAULT_OPENMP_THREADS 48)
 set(BUDDY_QWEN3_DEFAULT_BLIS_VECTOR_SIZE 32)
 set(BUDDY_QWEN3_DEFAULT_BLIS_PARALLEL_OUTER_LOOP ON)
 set(BUDDY_QWEN3_DEFAULT_BATCH_TRANSPOSE_VECTOR_SIZE 32)
+set(BUDDY_QWEN3_DEFAULT_PREFILL_BLOCK_SIZE_Q 16)
+set(BUDDY_QWEN3_DEFAULT_PREFILL_BLOCK_SIZE_KV 64)
 set(BUDDY_QWEN3_DEFAULT_PREFILL_AFFINE_PARALLEL_MAX_NESTED "")
 if(IS_RVV_PLATFORM)
   set(BUDDY_QWEN3_DEFAULT_OPENMP_THREADS 32)
@@ -78,6 +80,10 @@ set(BUDDY_QWEN3_BLIS_PARALLEL_OUTER_LOOP "${BUDDY_QWEN3_DEFAULT_BLIS_PARALLEL_OU
   "Whether BuddyQwen3 should parallelize the outer jc loop in matmul-vectorization-blis")
 set(BUDDY_QWEN3_BATCH_TRANSPOSE_VECTOR_SIZE "${BUDDY_QWEN3_DEFAULT_BATCH_TRANSPOSE_VECTOR_SIZE}" CACHE STRING
   "Vector width used by batchmatmul-transpose-b-vectorization for BuddyQwen3")
+set(BUDDY_QWEN3_PREFILL_BLOCK_SIZE_Q "${BUDDY_QWEN3_DEFAULT_PREFILL_BLOCK_SIZE_Q}" CACHE STRING
+  "Flash-attention prefill tile size along the query sequence for BuddyQwen3")
+set(BUDDY_QWEN3_PREFILL_BLOCK_SIZE_KV "${BUDDY_QWEN3_DEFAULT_PREFILL_BLOCK_SIZE_KV}" CACHE STRING
+  "Flash-attention prefill tile size along the key/value sequence for BuddyQwen3")
 set(BUDDY_QWEN3_PREFILL_AFFINE_PARALLEL_MAX_NESTED
   "${BUDDY_QWEN3_DEFAULT_PREFILL_AFFINE_PARALLEL_MAX_NESTED}" CACHE STRING
   "Maximum nested affine.parallel depth for BuddyQwen3 prefill; empty keeps MLIR defaults")
@@ -89,6 +95,15 @@ endif()
 set(BUDDY_QWEN3_BLIS_PASS_OPTS
   "vector-size=${BUDDY_QWEN3_BLIS_VECTOR_SIZE} parallel-outer-loop=${BUDDY_QWEN3_BLIS_PARALLEL_OUTER_LOOP_OPT}")
 set(OPENMP_NUM_THREADS "num-threads=${BUDDY_QWEN3_OPENMP_THREADS}")
+set(QWEN3_IMPORT_PYTHONPATH
+  "${LLVM_BINARY_DIR}/tools/mlir/python_packages/mlir_core:${BUDDY_MLIR_PYTHON_PACKAGES_DIR}:$ENV{PYTHONPATH}")
+set(QWEN3_IMPORT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/import-qwen3.py)
+if(TARGET python-package-buddy)
+  list(APPEND QWEN3_IMPORT_DEPENDS python-package-buddy)
+endif()
+if(TARGET BuddyMLIRPythonModules)
+  list(APPEND QWEN3_IMPORT_DEPENDS BuddyMLIRPythonModules)
+endif()
 if(BUDDY_QWEN3_PREFILL_AFFINE_PARALLEL_MAX_NESTED STREQUAL "")
   set(BUDDY_QWEN3_PREFILL_AFFINE_PARALLELIZE_PASS -affine-parallelize)
 else()
@@ -104,9 +119,14 @@ if(NOT IS_RVV_PLATFORM)
            ${CMAKE_CURRENT_BINARY_DIR}/forward_decode_0_6b.mlir
            ${CMAKE_CURRENT_BINARY_DIR}/subgraph0_decode_0_6b.mlir
            ${CMAKE_CURRENT_BINARY_DIR}/arg0_0_6b.data
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-qwen3.py
+    COMMAND ${CMAKE_COMMAND} -E env
+            "PYTHONPATH=${QWEN3_IMPORT_PYTHONPATH}"
+            BUDDY_QWEN3_PREFILL_BLOCK_SIZE_Q=${BUDDY_QWEN3_PREFILL_BLOCK_SIZE_Q}
+            BUDDY_QWEN3_PREFILL_BLOCK_SIZE_KV=${BUDDY_QWEN3_PREFILL_BLOCK_SIZE_KV}
+            ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/import-qwen3.py
             --output-dir ${CMAKE_CURRENT_BINARY_DIR}
             --precision f32
+    DEPENDS ${QWEN3_IMPORT_DEPENDS}
     COMMENT "Generating forward_prefill.mlir, subgraph0_prefill.mlir and arg0.data..."
   )
 endif()
