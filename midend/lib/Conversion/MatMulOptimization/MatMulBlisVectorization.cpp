@@ -44,10 +44,11 @@ class MatMulVectorizationBLISPattern : public ConversionPattern {
 public:
   explicit MatMulVectorizationBLISPattern(MLIRContext *context,
                                           int64_t vectorSizeParam,
-                                          bool parallelOuterLoopParam)
+                                          bool parallelOuterLoopParam,
+                                          int64_t ncSizeParam)
       : ConversionPattern(linalg::MatmulOp::getOperationName(), 1, context),
         vectorSize(vectorSizeParam),
-        parallelOuterLoop(parallelOuterLoopParam) {}
+        parallelOuterLoop(parallelOuterLoopParam), ncSize(ncSizeParam) {}
 
   LogicalResult
   matchAndRewrite(Operation *op, ArrayRef<Value> /*operands*/,
@@ -74,7 +75,7 @@ public:
 
     // Fixed BLIS blocking parameters from txt file
     const Value nc = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getIndexAttr(256)); // nc = 256
+        loc, rewriter.getIndexAttr(ncSize));
     const Value kc = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIndexAttr(128)); // kc = 128
     const Value mc = rewriter.create<arith::ConstantOp>(
@@ -617,6 +618,7 @@ public:
 private:
   int64_t vectorSize;
   bool parallelOuterLoop;
+  int64_t ncSize;
 };
 } // end anonymous namespace
 
@@ -647,6 +649,11 @@ public:
           "Parallelize the outer jc loop in addition to the inner ic loop."),
       llvm::cl::init(true)};
 
+  Option<int64_t> ncSize{
+      *this, "nc-size",
+      llvm::cl::desc("Specify the outer jc blocking size used by BLIS."),
+      llvm::cl::init(256)};
+
   void runOnOperation() override;
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -670,7 +677,7 @@ void MatMulVectorizationBLISPass::runOnOperation() {
 
   RewritePatternSet patterns(context);
   patterns.add<MatMulVectorizationBLISPattern>(context, vectorSize,
-                                               parallelOuterLoop);
+                                               parallelOuterLoop, ncSize);
 
   if (failed(applyPartialConversion(module, target, std::move(patterns))))
     signalPassFailure();
