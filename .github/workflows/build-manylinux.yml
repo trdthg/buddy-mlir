@@ -24,39 +24,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, riscv64]
+        arch: [riscv64]
         python: ["3.10", "3.11", "3.12", "3.13"]
         include:
-          - arch: x64
-            target_arch: x86_64
-            experimental: false
+          # - arch: x64
+          #   os: ubuntu-24.04
+          #   target_arch: x86_64
+          #   experimental: false
           - arch: riscv64
+            os: ubuntu-24.04-riscv-2xlarge
             target_arch: riscv64
             experimental: true
 
     runs-on:
-      - self-hosted
-      - ${{ matrix.arch }}
+      - ${{ matrix.os }}
 
     steps:
       - name: Checkout repository (x64)
-        if: matrix.arch == 'x64'
         uses: actions/checkout@v4
         with:
           submodules: false
-
-      - name: Checkout from local Gitea (riscv64)
-        if: matrix.arch == 'riscv64'
-        run: |
-          # Self-hosted workspaces are dirty; reset remotes and force the exact GitHub SHA.
-          git remote remove origin || true
-          git remote remove github || true
-          git remote add origin https://community-ci.openruyi.cn/RuyiAI-Stack/buddy-mlir
-          git remote add github https://github.com/buddy-compiler/buddy-mlir.git
-          git fetch --depth=1 origin
-          git fetch github ${{ github.sha }}
-          git checkout --force ${{ github.sha }}
-          git clean -fdx
 
       - name: Prepare variables
         id: vars
